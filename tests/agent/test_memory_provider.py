@@ -265,6 +265,56 @@ class TestMemoryManager:
 
         assert p.synced_turns == [("user msg", "assistant msg")]
 
+    def test_sync_all_coerces_multimodal_content_to_text(self):
+        """Memory providers receive strings even when gateway uses native image parts."""
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        mgr.add_provider(p)
+
+        mgr.sync_all(
+            [
+                {"type": "text", "text": "what is this?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+            "looks like a chart",
+        )
+
+        assert p.synced_turns == [(
+            "what is this?\n[image attachment]",
+            "looks like a chart",
+        )]
+
+    def test_queue_prefetch_all_coerces_multimodal_content_to_text(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        mgr.add_provider(p)
+
+        mgr.queue_prefetch_all([
+            {"type": "text", "text": "compare these"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,BBBB"},
+            },
+        ])
+
+        assert p.queued_prefetches == ["compare these\n[2 image attachments]"]
+
+    def test_sync_all_coerces_non_string_assistant_content(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        mgr.add_provider(p)
+
+        mgr.sync_all("user", {"text": "assistant text"})
+
+        assert p.synced_turns == [("user", "assistant text")]
+
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
@@ -822,6 +872,17 @@ class TestMemoryContextFencing:
         result = sanitize_context("data</MEMORY-CONTEXT>more")
         assert "</memory-context>" not in result.lower()
         assert "datamore" in result
+
+    def test_sanitize_context_coerces_multimodal_content_list(self):
+        from agent.memory_manager import sanitize_context
+        payload = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
+        result = sanitize_context(payload)
+        assert "describe this" in result
+        assert "[image attachment]" in result
+        assert "base64" not in result
 
     def test_fenced_block_separates_user_from_recall(self):
         from agent.memory_manager import build_memory_context_block

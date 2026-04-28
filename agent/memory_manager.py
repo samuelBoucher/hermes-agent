@@ -25,6 +25,7 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import inspect
@@ -51,12 +52,69 @@ _INTERNAL_NOTE_RE = re.compile(
 )
 
 
-def sanitize_context(text: str) -> str:
+def sanitize_context(text: Any) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
+    text = coerce_memory_text(text)
     text = _INTERNAL_CONTEXT_RE.sub('', text)
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
     return text
+
+
+def coerce_memory_text(value: Any) -> str:
+    """Return a safe text representation for memory providers.
+
+    Gateway/API callers may pass OpenAI-style multimodal ``content`` lists
+    (text + image_url parts) into ``run_conversation``. Memory backends and
+    sanitizers expect strings; storing raw multimodal payloads is both noisy
+    and can include huge base64 image data. Keep user-visible text, replace
+    images with a small marker, and fall back to compact JSON/stringification
+    for unusual structures.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        image_count = 0
+        for item in value:
+            if isinstance(item, str):
+                if item.strip():
+                    parts.append(item)
+                continue
+            if isinstance(item, dict):
+                typ = item.get("type")
+                if typ in {"text", "input_text"}:
+                    text = item.get("text") or item.get("content") or ""
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+                    continue
+                if typ in {"image_url", "input_image"}:
+                    image_count += 1
+                    continue
+            try:
+                rendered = json.dumps(item, ensure_ascii=False, default=str)
+            except Exception:
+                rendered = str(item)
+            if rendered.strip():
+                parts.append(rendered)
+        if image_count:
+            marker = (
+                "[image attachment]"
+                if image_count == 1
+                else f"[{image_count} image attachments]"
+            )
+            parts.append(marker)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 class StreamingContextScrubber:
@@ -357,6 +415,7 @@ class MemoryManager:
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
+        query = coerce_memory_text(query)
         for provider in self._providers:
             try:
                 provider.queue_prefetch(query, session_id=session_id)
@@ -389,6 +448,8 @@ class MemoryManager:
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Sync a completed turn to all providers."""
+        user_content = coerce_memory_text(user_content)
+        assistant_content = coerce_memory_text(assistant_content)
         for provider in self._providers:
             try:
                 if messages is not None and self._provider_sync_accepts_messages(provider):
