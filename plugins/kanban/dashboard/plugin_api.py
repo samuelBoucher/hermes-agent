@@ -87,6 +87,70 @@ def _conn():
     return kanban_db.connect()
 
 
+def _dashboard_kanban_config() -> dict[str, Any]:
+    """Return dashboard.kanban config, tolerating missing/bad config."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return {}
+    dash_cfg = cfg.get("dashboard") or {}
+    if not isinstance(dash_cfg, dict):
+        return {}
+    k_cfg = dash_cfg.get("kanban") or {}
+    return k_cfg if isinstance(k_cfg, dict) else {}
+
+
+def _read_only_mode() -> bool:
+    """Whether dashboard Kanban mutations are disabled by config."""
+    k_cfg = _dashboard_kanban_config()
+    return bool(k_cfg.get("read_only_mode", k_cfg.get("read_only", False)))
+
+
+def _require_writes_enabled() -> None:
+    """Reject dashboard-originating writes when read-only mode is enabled."""
+    if _read_only_mode():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Kanban dashboard is in read-only mode "
+                "(dashboard.kanban.read_only_mode=true)"
+            ),
+        )
+
+
+def _scope_dict(latest_event_id: int = 0, now: Optional[int] = None) -> dict[str, Any]:
+    """Return source-of-truth metadata for the operator-facing banner."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+    except Exception:
+        profile = "unknown"
+    try:
+        from hermes_constants import display_hermes_home
+        hermes_home = display_hermes_home()
+    except Exception:
+        hermes_home = "unknown"
+
+    db_path = kanban_db.kanban_db_path()
+    db_exists = db_path.exists()
+    try:
+        db_mtime = int(db_path.stat().st_mtime) if db_exists else None
+    except OSError:
+        db_mtime = None
+    generated_at = int(now if now is not None else time.time())
+    return {
+        "profile": profile,
+        "hermes_home": hermes_home,
+        "kanban_db": str(db_path),
+        "db_exists": db_exists,
+        "db_mtime": db_mtime,
+        "read_only": _read_only_mode(),
+        "latest_event_id": int(latest_event_id or 0),
+        "generated_at": generated_at,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -256,6 +320,7 @@ def get_board(
             )
         ]
 
+        now = int(time.time())
         return {
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
@@ -263,7 +328,8 @@ def get_board(
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
-            "now": int(time.time()),
+            "now": now,
+            "scope": _scope_dict(int(latest_event_id), now),
         }
     finally:
         conn.close()
@@ -312,6 +378,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody):
+    _require_writes_enabled()
     conn = _conn()
     try:
         task_id = kanban_db.create_task(
@@ -374,6 +441,7 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody):
+    _require_writes_enabled()
     conn = _conn()
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -528,6 +596,7 @@ class CommentBody(BaseModel):
 
 @router.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, payload: CommentBody):
+    _require_writes_enabled()
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     conn = _conn()
@@ -553,6 +622,7 @@ class LinkBody(BaseModel):
 
 @router.post("/links")
 def add_link(payload: LinkBody):
+    _require_writes_enabled()
     conn = _conn()
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
@@ -565,6 +635,7 @@ def add_link(payload: LinkBody):
 
 @router.delete("/links")
 def delete_link(parent_id: str = Query(...), child_id: str = Query(...)):
+    _require_writes_enabled()
     conn = _conn()
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
@@ -587,6 +658,7 @@ class BulkTaskBody(BaseModel):
 
 @router.post("/tasks/bulk")
 def bulk_update(payload: BulkTaskBody):
+    _require_writes_enabled()
     """Apply the same patch to every id in ``payload.ids``.
 
     This is an *independent* iteration — per-task failures don't abort
@@ -669,19 +741,13 @@ def get_config():
     Used by the UI to pre-select tenant filters, toggle markdown rendering,
     or set column-width preferences without a round-trip per page load.
     """
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-    except Exception:
-        cfg = {}
-    dash_cfg = (cfg.get("dashboard") or {})
-    # dashboard.kanban may itself be a dict; fall back to {}.
-    k_cfg = dash_cfg.get("kanban") or {}
+    k_cfg = _dashboard_kanban_config()
     return {
         "default_tenant": k_cfg.get("default_tenant") or "",
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),
+        "read_only_mode": _read_only_mode(),
     }
 
 
@@ -761,6 +827,7 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max")):
+    _require_writes_enabled()
     conn = _conn()
     try:
         result = kanban_db.dispatch_once(

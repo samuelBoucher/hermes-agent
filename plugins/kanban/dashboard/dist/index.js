@@ -270,6 +270,11 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+    const readOnly = Boolean(
+      (config && config.read_only_mode) ||
+      (board && board.scope && board.scope.read_only),
+    );
+    const readOnlyMessage = "Kanban dashboard read-only mode is enabled; use the CLI or disable dashboard.kanban.read_only_mode to mutate tasks.";
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -395,6 +400,7 @@
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
+      if (readOnly) { setError(readOnlyMessage); return; }
       const confirmMsg = DESTRUCTIVE_TRANSITIONS[newStatus];
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       setBoard(function (b) {
@@ -421,9 +427,10 @@
         setError(`Move failed: ${err.message || err}`);
         loadBoard();
       });
-    }, [loadBoard]);
+    }, [loadBoard, readOnly, readOnlyMessage]);
 
     const createTask = useCallback(function (body) {
+      if (readOnly) { setError(readOnlyMessage); return Promise.resolve({ ok: false }); }
       return SDK.fetchJSON(`${API}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -439,7 +446,7 @@
         loadBoard();
         return res;
       });
-    }, [loadBoard]);
+    }, [loadBoard, readOnly, readOnlyMessage]);
 
     const toggleSelected = useCallback(function (id, additive) {
       setSelectedIds(function (prev) {
@@ -452,6 +459,7 @@
     const clearSelected = useCallback(function () { setSelectedIds(new Set()); }, []);
 
     const applyBulk = useCallback(function (patch, confirmMsg) {
+      if (readOnly) { setError(readOnlyMessage); return; }
       if (selectedIds.size === 0) return;
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const body = Object.assign({ ids: Array.from(selectedIds) }, patch);
@@ -470,7 +478,7 @@
           loadBoard();
         })
         .catch(function (e) { setError(String(e.message || e)); });
-    }, [selectedIds, loadBoard, clearSelected]);
+    }, [selectedIds, loadBoard, clearSelected, readOnly, readOnlyMessage]);
 
     // --- render -------------------------------------------------------------
     if (loading && !board) {
@@ -495,19 +503,24 @@
       h("div", { className: "hermes-kanban flex flex-col gap-4" },
         h(BoardToolbar, {
           board: board,
+          readOnly,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
           onNudgeDispatch: function () {
+            if (readOnly) { setError(readOnlyMessage); return; }
             SDK.fetchJSON(`${API}/dispatch?max=8`, { method: "POST" })
               .then(loadBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
         }),
-        selectedIds.size > 0 ? h(BulkActionBar, {
+        h(ScopeBanner, { scope: board.scope || {}, readOnly }),
+        readOnly ? h("div", { className: "hermes-kanban-readonly-note" },
+          "Action-gated: task creation, drag/drop, bulk edits, comments, dependencies, and dispatcher nudges are disabled in this view.") : null,
+        !readOnly && selectedIds.size > 0 ? h(BulkActionBar, {
           count: selectedIds.size,
           assignees: (board && board.assignees) || [],
           onApply: applyBulk,
@@ -517,6 +530,7 @@
         h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
+          readOnly,
           selectedIds,
           toggleSelected,
           onMove: moveTask,
@@ -531,7 +545,32 @@
           renderMarkdown: renderMd,
           allTasks: board.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           eventTick: taskEventTick[selectedTaskId] || 0,
+          readOnly,
         }) : null,
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Truth / scope banner
+  // -------------------------------------------------------------------------
+
+  function ScopeBanner(props) {
+    const scope = props.scope || {};
+    const generated = scope.generated_at && timeAgo ? timeAgo(scope.generated_at) : "unknown";
+    const dbFresh = scope.db_mtime && timeAgo ? timeAgo(scope.db_mtime) : "unknown";
+    return h("div", {
+      className: cn("hermes-kanban-scope", props.readOnly ? "hermes-kanban-scope--readonly" : ""),
+    },
+      h("div", { className: "hermes-kanban-scope-title" },
+        props.readOnly ? "Read-only Kanban source" : "Kanban source"),
+      h("div", { className: "hermes-kanban-scope-grid" },
+        h("span", null, "profile: ", h("strong", null, scope.profile || "unknown")),
+        h("span", null, "HERMES_HOME: ", h("code", null, scope.hermes_home || "unknown")),
+        h("span", null, "db: ", h("code", null, scope.kanban_db || "unknown")),
+        h("span", null, "event: ", h("strong", null, String(scope.latest_event_id || 0))),
+        h("span", null, "db freshness: ", h("strong", null, dbFresh)),
+        h("span", null, "rendered: ", h("strong", null, generated)),
       ),
     );
   }
@@ -597,8 +636,11 @@
         "Lanes by profile",
       ),
       h("div", { className: "flex-1" }),
+      props.readOnly ? h(Badge, { variant: "outline", className: "hermes-kanban-readonly-badge" }, "Read-only") : null,
       h(Button, {
         onClick: props.onNudgeDispatch,
+        disabled: props.readOnly,
+        title: props.readOnly ? "Disabled by dashboard.kanban.read_only_mode" : "Ask the dispatcher to scan ready tasks now",
         size: "sm",
       }, "Nudge dispatcher"),
       h(Button, {
@@ -676,6 +718,7 @@
           key: col.name,
           column: col,
           laneByProfile: props.laneByProfile,
+          readOnly: props.readOnly,
           selectedIds: props.selectedIds,
           toggleSelected: props.toggleSelected,
           onMove: props.onMove,
@@ -697,6 +740,7 @@
       if (!colRef.current) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
+        if (props.readOnly) return;
         if (e.detail && e.detail.status === props.column.name) {
           props.onMove(e.detail.taskId, props.column.name);
         }
@@ -706,12 +750,14 @@
     }, [props.column.name, props.onMove]);
 
     const handleDragOver = function (e) {
+      if (props.readOnly) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
+      if (props.readOnly) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -735,6 +781,7 @@
       "data-kanban-column": props.column.name,
       className: cn(
         "hermes-kanban-column",
+        props.readOnly ? "hermes-kanban-column--readonly" : "",
         dragOver ? "hermes-kanban-column--drop" : "",
       ),
       onDragOver: handleDragOver,
@@ -747,7 +794,7 @@
           COLUMN_LABEL[props.column.name] || props.column.name),
         h("span", { className: "hermes-kanban-column-count" },
           props.column.tasks.length),
-        h("button", {
+        props.readOnly ? null : h("button", {
           type: "button",
           className: "hermes-kanban-column-add",
           title: "Create task in this column",
@@ -756,7 +803,7 @@
       ),
       h("div", { className: "hermes-kanban-column-sub" },
         COLUMN_HELP[props.column.name] || ""),
-      showCreate ? h(InlineCreate, {
+      showCreate && !props.readOnly ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
         onSubmit: function (body) {
@@ -777,6 +824,7 @@
                   lane.tasks.map(function (t) {
                     return h(TaskCard, {
                       key: t.id, task: t,
+                      readOnly: props.readOnly,
                       selected: props.selectedIds.has(t.id),
                       toggleSelected: props.toggleSelected,
                       onOpen: props.onOpen,
@@ -787,6 +835,7 @@
             : props.column.tasks.map(function (t) {
                 return h(TaskCard, {
                   key: t.id, task: t,
+                  readOnly: props.readOnly,
                   selected: props.selectedIds.has(t.id),
                   toggleSelected: props.toggleSelected,
                   onOpen: props.onOpen,
@@ -826,16 +875,18 @@
     const cardRef = useRef(null);
 
     useEffect(function () {
+      if (props.readOnly) return undefined;
       return attachTouchDrag(cardRef.current, t.id);
-    }, [t.id]);
+    }, [t.id, props.readOnly]);
 
     const handleDragStart = function (e) {
+      if (props.readOnly) return;
       e.dataTransfer.setData(MIME_TASK, t.id);
       e.dataTransfer.effectAllowed = "move";
     };
     const handleClick = function (e) {
       // Shift-click or ctrl/cmd-click toggles selection instead of opening.
-      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      if (!props.readOnly && (e.shiftKey || e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         e.stopPropagation();
         props.toggleSelected(t.id, e.ctrlKey || e.metaKey);
@@ -857,14 +908,14 @@
         props.selected ? "hermes-kanban-card--selected" : "",
         stalenessClass(t),
       ),
-      draggable: true,
-      onDragStart: handleDragStart,
+      draggable: !props.readOnly,
+      onDragStart: props.readOnly ? undefined : handleDragStart,
       onClick: handleClick,
     },
       h(Card, null,
         h(CardContent, { className: "hermes-kanban-card-content" },
           h("div", { className: "hermes-kanban-card-row" },
-            h("input", {
+            props.readOnly ? null : h("input", {
               type: "checkbox",
               className: "hermes-kanban-card-check",
               checked: props.selected,
@@ -1045,6 +1096,7 @@
     };
 
     const doPatch = function (patch, opts) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       if (opts && opts.confirm && !window.confirm(opts.confirm)) {
         return Promise.resolve();
       }
@@ -1056,6 +1108,7 @@
     };
 
     const addLink = function (parentId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       return SDK.fetchJSON(`${API}/links`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1064,12 +1117,14 @@
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeLink = function (parentId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       const qs = new URLSearchParams({ parent_id: parentId, child_id: props.taskId });
       return SDK.fetchJSON(`${API}/links?${qs}`, { method: "DELETE" })
         .then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const addChild = function (childId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       return SDK.fetchJSON(`${API}/links`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1078,6 +1133,7 @@
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeChild = function (childId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       const qs = new URLSearchParams({ parent_id: props.taskId, child_id: childId });
       return SDK.fetchJSON(`${API}/links?${qs}`, { method: "DELETE" })
         .then(function () { load(); props.onRefresh(); })
@@ -1109,8 +1165,9 @@
           onRemoveParent: removeLink,
           onAddChild: addChild,
           onRemoveChild: removeChild,
+          readOnly: props.readOnly,
         }) : null,
-        data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
+        data && !props.readOnly ? h("div", { className: "hermes-kanban-drawer-comment-row" },
           h(Input, {
             value: newComment,
             onChange: function (e) { setNewComment(e.target.value); },
@@ -1140,7 +1197,7 @@
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
-        props.editing
+        props.editing && !props.readOnly
           ? h(TitleEditor, {
               initial: t.title || "",
               onSave: function (newTitle) {
@@ -1150,14 +1207,14 @@
             })
           : h("span", {
               className: "hermes-kanban-drawer-title-text",
-              title: "Click to edit",
-              onClick: function () { props.setEditing(true); },
+              title: props.readOnly ? "Read-only" : "Click to edit",
+              onClick: function () { if (!props.readOnly) props.setEditing(true); },
             }, t.title || "(untitled)"),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: "Status", value: t.status }),
-        h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
-        h(PriorityEditor, { task: t, onPatch: props.onPatch }),
+        h(AssigneeEditor, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
+        h(PriorityEditor, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
         t.tenant ? h(MetaRow, { label: "Tenant", value: t.tenant }) : null,
         h(MetaRow, {
           label: "Workspace",
@@ -1169,11 +1226,12 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: "Created by", value: t.created_by }) : null,
       ),
-      h(StatusActions, { task: t, onPatch: props.onPatch }),
+      h(StatusActions, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
       h(BodyEditor, {
         task: t,
         renderMarkdown: props.renderMarkdown,
         onPatch: props.onPatch,
+        readOnly: props.readOnly,
       }),
       h(DependencyEditor, {
         task: t,
@@ -1182,6 +1240,7 @@
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
         onRemoveChild: props.onRemoveChild,
+        readOnly: props.readOnly,
       }),
       t.result ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, "Result"),
@@ -1366,13 +1425,13 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(props.task.assignee || "");
     useEffect(function () { setV(props.task.assignee || ""); }, [props.task.assignee]);
-    if (!editing) {
+    if (!editing || props.readOnly) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, "Assignee"),
         h("span", {
-          className: "hermes-kanban-meta-value hermes-kanban-editable",
-          onClick: function () { setEditing(true); },
-          title: "Click to edit",
+          className: cn("hermes-kanban-meta-value", props.readOnly ? "" : "hermes-kanban-editable"),
+          onClick: function () { if (!props.readOnly) setEditing(true); },
+          title: props.readOnly ? "Read-only" : "Click to edit",
         }, props.task.assignee || "unassigned"),
       );
     }
@@ -1398,13 +1457,13 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(String(props.task.priority || 0));
     useEffect(function () { setV(String(props.task.priority || 0)); }, [props.task.priority]);
-    if (!editing) {
+    if (!editing || props.readOnly) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, "Priority"),
         h("span", {
-          className: "hermes-kanban-meta-value hermes-kanban-editable",
-          onClick: function () { setEditing(true); },
-          title: "Click to edit",
+          className: cn("hermes-kanban-meta-value", props.readOnly ? "" : "hermes-kanban-editable"),
+          onClick: function () { if (!props.readOnly) setEditing(true); },
+          title: props.readOnly ? "Read-only" : "Click to edit",
         }, String(props.task.priority)),
       );
     }
@@ -1429,6 +1488,7 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(props.task.body || "");
     useEffect(function () { setV(props.task.body || ""); }, [props.task.body]);
+    useEffect(function () { if (props.readOnly) setEditing(false); }, [props.readOnly]);
     const save = function () {
       props.onPatch({ body: v }).then(function () { setEditing(false); });
     };
@@ -1444,7 +1504,7 @@
                 size: "sm",
               }, "Cancel"),
             )
-          : h("button", {
+          : props.readOnly ? null : h("button", {
               type: "button",
               onClick: function () { setEditing(true); },
               className: "hermes-kanban-edit-link",
@@ -1487,7 +1547,7 @@
             : (links.parents || []).map(function (id) {
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
                   id,
-                  h("button", {
+                  props.readOnly ? null : h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
                     onClick: function () { props.onRemoveParent(id); },
@@ -1497,7 +1557,7 @@
               }),
         ),
       ),
-      h("div", { className: "hermes-kanban-deps-row" },
+      props.readOnly ? null : h("div", { className: "hermes-kanban-deps-row" },
         h(Select, {
           value: newParent,
           onChange: function (e) { setNewParent(e.target.value); },
@@ -1526,7 +1586,7 @@
             : (links.children || []).map(function (id) {
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
                   id,
-                  h("button", {
+                  props.readOnly ? null : h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
                     onClick: function () { props.onRemoveChild(id); },
@@ -1536,7 +1596,7 @@
               }),
         ),
       ),
-      h("div", { className: "hermes-kanban-deps-row" },
+      props.readOnly ? null : h("div", { className: "hermes-kanban-deps-row" },
         h(Select, {
           value: newChild,
           onChange: function (e) { setNewChild(e.target.value); },
@@ -1564,8 +1624,8 @@
     const t = props.task;
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
-        onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
-        disabled: enabled === false,
+        onClick: function () { if (!props.readOnly && enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
+        disabled: props.readOnly || enabled === false,
         size: "sm",
       }, label);
     };
