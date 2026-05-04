@@ -363,6 +363,11 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+    const readOnly = Boolean(
+      (config && config.read_only_mode) ||
+      (boardData && boardData.scope && boardData.scope.read_only),
+    );
+    const readOnlyMessage = "Kanban dashboard read-only mode is enabled; use the CLI or disable dashboard.kanban.read_only_mode to mutate tasks.";
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -512,6 +517,7 @@
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
+      if (readOnly) { setError(readOnlyMessage); return; }
       const confirmMsg = DESTRUCTIVE_TRANSITIONS[newStatus];
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const patch = withCompletionSummary({ status: newStatus }, 1);
@@ -540,9 +546,10 @@
         setError(`Move failed: ${err.message || err}`);
         loadBoard();
       });
-    }, [loadBoard, board]);
+    }, [loadBoard, board, readOnly, readOnlyMessage]);
 
     const createTask = useCallback(function (body) {
+      if (readOnly) { setError(readOnlyMessage); return Promise.resolve({ ok: false }); }
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -559,7 +566,7 @@
         loadBoardList();  // refresh counts in the switcher
         return res;
       });
-    }, [loadBoard, loadBoardList, board]);
+    }, [loadBoard, loadBoardList, board, readOnly, readOnlyMessage]);
 
     const toggleSelected = useCallback(function (id, additive) {
       setSelectedIds(function (prev) {
@@ -572,6 +579,7 @@
     const clearSelected = useCallback(function () { setSelectedIds(new Set()); }, []);
 
     const applyBulk = useCallback(function (patch, confirmMsg) {
+      if (readOnly) { setError(readOnlyMessage); return; }
       if (selectedIds.size === 0) return;
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const finalPatch = withCompletionSummary(patch, selectedIds.size);
@@ -592,7 +600,7 @@
           loadBoard();
         })
         .catch(function (e) { setError(String(e.message || e)); });
-    }, [selectedIds, loadBoard, clearSelected, board]);
+    }, [selectedIds, loadBoard, clearSelected, board, readOnly, readOnlyMessage]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -608,6 +616,7 @@
     }, [board]);
 
     const createNewBoard = useCallback(function (payload) {
+      if (readOnly) { setError(readOnlyMessage); return Promise.resolve({ ok: false }); }
       return SDK.fetchJSON(`${API}/boards`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -618,9 +627,10 @@
         if (slug && payload.switch) switchBoard(slug);
         return res;
       });
-    }, [loadBoardList, switchBoard]);
+    }, [loadBoardList, switchBoard, readOnly, readOnlyMessage]);
 
     const deleteBoard = useCallback(function (slug) {
+      if (readOnly) { setError(readOnlyMessage); return Promise.resolve(); }
       if (!slug || slug === "default") return Promise.resolve();
       return SDK.fetchJSON(`${API}/boards/${encodeURIComponent(slug)}`, {
         method: "DELETE",
@@ -628,7 +638,7 @@
         loadBoardList();
         if (board === slug) switchBoard("default");
       });
-    }, [board, loadBoardList, switchBoard]);
+    }, [board, loadBoardList, switchBoard, readOnly, readOnlyMessage]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -654,6 +664,7 @@
         h(BoardSwitcher, {
           board: board,
           boardList: boardList,
+          readOnly,
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
           onDeleteBoard: deleteBoard,
@@ -670,19 +681,24 @@
         }),
         h(BoardToolbar, {
           board: boardData,
+          readOnly,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
           onNudgeDispatch: function () {
+            if (readOnly) { setError(readOnlyMessage); return; }
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
         }),
-        selectedIds.size > 0 ? h(BulkActionBar, {
+        h(ScopeBanner, { scope: (boardData && boardData.scope) || {}, readOnly }),
+        readOnly ? h("div", { className: "hermes-kanban-readonly-note" },
+          "Action-gated: task creation, drag/drop, bulk edits, comments, dependencies, board edits, and dispatcher nudges are disabled in this view.") : null,
+        !readOnly && selectedIds.size > 0 ? h(BulkActionBar, {
           count: selectedIds.size,
           assignees: (boardData && boardData.assignees) || [],
           onApply: applyBulk,
@@ -692,6 +708,7 @@
         h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
+          readOnly,
           selectedIds,
           toggleSelected,
           onMove: moveTask,
@@ -708,6 +725,7 @@
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
+          readOnly,
         }) : null,
       ),
     );
@@ -1132,7 +1150,9 @@
         title: "Boards let you separate unrelated streams of work",
       },
         h(Button, {
-          onClick: props.onNewClick,
+          onClick: props.readOnly ? undefined : props.onNewClick,
+          disabled: props.readOnly,
+          title: props.readOnly ? "Disabled by dashboard.kanban.read_only_mode" : "Boards let you separate unrelated streams of work",
           size: "sm",
           className: "h-7 text-xs",
         }, "+ New board"),
@@ -1163,7 +1183,8 @@
         ),
         h("div", { className: "flex-1" }),
         h(Button, {
-          onClick: props.onNewClick,
+          onClick: props.readOnly ? undefined : props.onNewClick,
+          disabled: props.readOnly,
           size: "sm",
           className: "h-8",
         }, "+ New board"),
@@ -1174,11 +1195,12 @@
                 `Archive board '${currentName}'? ` +
                 `It will be moved to boards/_archived/ so you can recover it later. ` +
                 `Tasks on this board will no longer appear anywhere in the UI.`;
-              if (window.confirm(msg)) props.onDeleteBoard(props.board);
+              if (!props.readOnly && window.confirm(msg)) props.onDeleteBoard(props.board);
             },
             size: "sm",
+            disabled: props.readOnly,
             className: "h-8",
-            title: "Archive this board",
+            title: props.readOnly ? "Disabled by dashboard.kanban.read_only_mode" : "Archive this board",
           }, "Archive")
           : null,
       ),
@@ -1276,7 +1298,7 @@
             }),
           ),
           h("label", { className: "flex items-center gap-2 text-xs" },
-            h("input", {
+            props.readOnly ? null : h("input", {
               type: "checkbox",
               checked: switchTo,
               onChange: function (e) { setSwitchTo(e.target.checked); },
@@ -1298,6 +1320,31 @@
             disabled: submitting || !slug.trim(),
           }, submitting ? "Creating…" : "Create board"),
         ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Truth / scope banner
+  // -------------------------------------------------------------------------
+
+  function ScopeBanner(props) {
+    const scope = props.scope || {};
+    const generated = scope.generated_at && timeAgo ? timeAgo(scope.generated_at) : "unknown";
+    const dbFresh = scope.db_mtime && timeAgo ? timeAgo(scope.db_mtime) : "unknown";
+    return h("div", {
+      className: cn("hermes-kanban-scope", props.readOnly ? "hermes-kanban-scope--readonly" : ""),
+    },
+      h("div", { className: "hermes-kanban-scope-title" },
+        props.readOnly ? "Read-only Kanban source" : "Kanban source"),
+      h("div", { className: "hermes-kanban-scope-grid" },
+        h("span", null, "profile: ", h("strong", null, scope.profile || "unknown")),
+        h("span", null, "board: ", h("strong", null, scope.board || "default")),
+        h("span", null, "HERMES_HOME: ", h("code", null, scope.hermes_home || "unknown")),
+        h("span", null, "db: ", h("code", null, scope.kanban_db || "unknown")),
+        h("span", null, "event: ", h("strong", null, String(scope.latest_event_id || 0))),
+        h("span", null, "db freshness: ", h("strong", null, dbFresh)),
+        h("span", null, "rendered: ", h("strong", null, generated)),
       ),
     );
   }
@@ -1361,8 +1408,11 @@
         "Lanes by profile",
       ),
       h("div", { className: "flex-1" }),
+      props.readOnly ? h(Badge, { variant: "outline", className: "hermes-kanban-readonly-badge" }, "Read-only") : null,
       h(Button, {
         onClick: props.onNudgeDispatch,
+        disabled: props.readOnly,
+        title: props.readOnly ? "Disabled by dashboard.kanban.read_only_mode" : "Ask the dispatcher to scan ready tasks now",
         size: "sm",
       }, "Nudge dispatcher"),
       h(Button, {
@@ -1440,6 +1490,7 @@
           key: col.name,
           column: col,
           laneByProfile: props.laneByProfile,
+          readOnly: props.readOnly,
           selectedIds: props.selectedIds,
           toggleSelected: props.toggleSelected,
           onMove: props.onMove,
@@ -1461,21 +1512,24 @@
       if (!colRef.current) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
+        if (props.readOnly) return;
         if (e.detail && e.detail.status === props.column.name) {
           props.onMove(e.detail.taskId, props.column.name);
         }
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove]);
+    }, [props.column.name, props.onMove, props.readOnly]);
 
     const handleDragOver = function (e) {
+      if (props.readOnly) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
+      if (props.readOnly) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -1499,6 +1553,7 @@
       "data-kanban-column": props.column.name,
       className: cn(
         "hermes-kanban-column",
+        props.readOnly ? "hermes-kanban-column--readonly" : "",
         dragOver ? "hermes-kanban-column--drop" : "",
       ),
       onDragOver: handleDragOver,
@@ -1511,7 +1566,7 @@
           COLUMN_LABEL[props.column.name] || props.column.name),
         h("span", { className: "hermes-kanban-column-count" },
           props.column.tasks.length),
-        h("button", {
+        props.readOnly ? null : h("button", {
           type: "button",
           className: "hermes-kanban-column-add",
           title: "Create task in this column",
@@ -1520,7 +1575,7 @@
       ),
       h("div", { className: "hermes-kanban-column-sub" },
         COLUMN_HELP[props.column.name] || ""),
-      showCreate ? h(InlineCreate, {
+      showCreate && !props.readOnly ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
         onSubmit: function (body) {
@@ -1541,6 +1596,7 @@
                   lane.tasks.map(function (t) {
                     return h(TaskCard, {
                       key: t.id, task: t,
+                      readOnly: props.readOnly,
                       selected: props.selectedIds.has(t.id),
                       toggleSelected: props.toggleSelected,
                       onOpen: props.onOpen,
@@ -1551,6 +1607,7 @@
             : props.column.tasks.map(function (t) {
                 return h(TaskCard, {
                   key: t.id, task: t,
+                  readOnly: props.readOnly,
                   selected: props.selectedIds.has(t.id),
                   toggleSelected: props.toggleSelected,
                   onOpen: props.onOpen,
@@ -1590,16 +1647,18 @@
     const cardRef = useRef(null);
 
     useEffect(function () {
+      if (props.readOnly) return undefined;
       return attachTouchDrag(cardRef.current, t.id);
-    }, [t.id]);
+    }, [t.id, props.readOnly]);
 
     const handleDragStart = function (e) {
+      if (props.readOnly) return;
       e.dataTransfer.setData(MIME_TASK, t.id);
       e.dataTransfer.effectAllowed = "move";
     };
     const handleClick = function (e) {
       // Shift-click or ctrl/cmd-click toggles selection instead of opening.
-      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      if (!props.readOnly && (e.shiftKey || e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         e.stopPropagation();
         props.toggleSelected(t.id, e.ctrlKey || e.metaKey);
@@ -1621,8 +1680,8 @@
         props.selected ? "hermes-kanban-card--selected" : "",
         stalenessClass(t),
       ),
-      draggable: true,
-      onDragStart: handleDragStart,
+      draggable: !props.readOnly,
+      onDragStart: props.readOnly ? undefined : handleDragStart,
       onClick: handleClick,
     },
       h(Card, null,
@@ -1862,6 +1921,7 @@
     }, [props.onClose, editing]);
 
     const handleComment = function () {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return; }
       const body = newComment.trim();
       if (!body) return;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug), {
@@ -1876,6 +1936,7 @@
     };
 
     const doPatch = function (patch, opts) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       if (opts && opts.confirm && !window.confirm(opts.confirm)) {
         return Promise.resolve();
       }
@@ -1889,6 +1950,7 @@
     };
 
     const addLink = function (parentId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1897,12 +1959,14 @@
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeLink = function (parentId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       const qs = new URLSearchParams({ parent_id: parentId, child_id: props.taskId });
       return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
         .then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const addChild = function (childId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1911,6 +1975,7 @@
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeChild = function (childId) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       const qs = new URLSearchParams({ parent_id: props.taskId, child_id: childId });
       return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
         .then(function () { load(); props.onRefresh(); })
@@ -1918,6 +1983,7 @@
     };
 
     const toggleHomeSubscription = function (platform, currentlySubscribed) {
+      if (props.readOnly) { setErr("Read-only mode: dashboard mutations are disabled."); return Promise.resolve(); }
       // Optimistic flip + busy flag to keep double-clicks idempotent.
       setHomeBusy(function (b) { return Object.assign({}, b, { [platform]: true }); });
       setHomeChannels(function (list) {
@@ -1985,8 +2051,9 @@
           homeBusy: homeBusy,
           onToggleHomeSub: toggleHomeSubscription,
           onRefresh: props.onRefresh,
+          readOnly: props.readOnly,
         }) : null,
-        data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
+        data && !props.readOnly ? h("div", { className: "hermes-kanban-drawer-comment-row" },
           h(Input, {
             value: newComment,
             onChange: function (e) { setNewComment(e.target.value); },
@@ -2016,7 +2083,7 @@
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
-        props.editing
+        props.editing && !props.readOnly
           ? h(TitleEditor, {
               initial: t.title || "",
               onSave: function (newTitle) {
@@ -2026,14 +2093,14 @@
             })
           : h("span", {
               className: "hermes-kanban-drawer-title-text",
-              title: "Click to edit",
-              onClick: function () { props.setEditing(true); },
+              title: props.readOnly ? "Read-only" : "Click to edit",
+              onClick: function () { if (!props.readOnly) props.setEditing(true); },
             }, t.title || "(untitled)"),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: "Status", value: t.status }),
-        h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
-        h(PriorityEditor, { task: t, onPatch: props.onPatch }),
+        h(AssigneeEditor, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
+        h(PriorityEditor, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
         t.tenant ? h(MetaRow, { label: "Tenant", value: t.tenant }) : null,
         h(MetaRow, {
           label: "Workspace",
@@ -2045,7 +2112,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: "Created by", value: t.created_by }) : null,
       ),
-      h(StatusActions, { task: t, onPatch: props.onPatch }),
+      h(StatusActions, { task: t, onPatch: props.onPatch, readOnly: props.readOnly }),
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
@@ -2057,11 +2124,13 @@
         homeChannels: props.homeChannels || [],
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
+        readOnly: props.readOnly,
       }),
       h(BodyEditor, {
         task: t,
         renderMarkdown: props.renderMarkdown,
         onPatch: props.onPatch,
+        readOnly: props.readOnly,
       }),
       h(DependencyEditor, {
         task: t,
@@ -2070,6 +2139,7 @@
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
         onRemoveChild: props.onRemoveChild,
+        readOnly: props.readOnly,
       }),
       t.result ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, "Result"),
@@ -2284,13 +2354,13 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(props.task.assignee || "");
     useEffect(function () { setV(props.task.assignee || ""); }, [props.task.assignee]);
-    if (!editing) {
+    if (!editing || props.readOnly) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, "Assignee"),
         h("span", {
-          className: "hermes-kanban-meta-value hermes-kanban-editable",
-          onClick: function () { setEditing(true); },
-          title: "Click to edit",
+          className: cn("hermes-kanban-meta-value", props.readOnly ? "" : "hermes-kanban-editable"),
+          onClick: function () { if (!props.readOnly) setEditing(true); },
+          title: props.readOnly ? "Read-only" : "Click to edit",
         }, props.task.assignee || "unassigned"),
       );
     }
@@ -2316,13 +2386,13 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(String(props.task.priority || 0));
     useEffect(function () { setV(String(props.task.priority || 0)); }, [props.task.priority]);
-    if (!editing) {
+    if (!editing || props.readOnly) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, "Priority"),
         h("span", {
-          className: "hermes-kanban-meta-value hermes-kanban-editable",
-          onClick: function () { setEditing(true); },
-          title: "Click to edit",
+          className: cn("hermes-kanban-meta-value", props.readOnly ? "" : "hermes-kanban-editable"),
+          onClick: function () { if (!props.readOnly) setEditing(true); },
+          title: props.readOnly ? "Read-only" : "Click to edit",
         }, String(props.task.priority)),
       );
     }
@@ -2347,6 +2417,7 @@
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(props.task.body || "");
     useEffect(function () { setV(props.task.body || ""); }, [props.task.body]);
+    useEffect(function () { if (props.readOnly) setEditing(false); }, [props.readOnly]);
     const save = function () {
       props.onPatch({ body: v }).then(function () { setEditing(false); });
     };
@@ -2362,7 +2433,7 @@
                 size: "sm",
               }, "Cancel"),
             )
-          : h("button", {
+          : props.readOnly ? null : h("button", {
               type: "button",
               onClick: function () { setEditing(true); },
               className: "hermes-kanban-edit-link",
@@ -2405,7 +2476,7 @@
             : (links.parents || []).map(function (id) {
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
                   id,
-                  h("button", {
+                  props.readOnly ? null : h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
                     onClick: function () { props.onRemoveParent(id); },
@@ -2415,7 +2486,7 @@
               }),
         ),
       ),
-      h("div", { className: "hermes-kanban-deps-row" },
+      props.readOnly ? null : h("div", { className: "hermes-kanban-deps-row" },
         h(Select, Object.assign({
           value: newParent,
           className: "h-7 text-xs flex-1",
@@ -2443,7 +2514,7 @@
             : (links.children || []).map(function (id) {
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
                   id,
-                  h("button", {
+                  props.readOnly ? null : h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
                     onClick: function () { props.onRemoveChild(id); },
@@ -2453,7 +2524,7 @@
               }),
         ),
       ),
-      h("div", { className: "hermes-kanban-deps-row" },
+      props.readOnly ? null : h("div", { className: "hermes-kanban-deps-row" },
         h(Select, Object.assign({
           value: newChild,
           className: "h-7 text-xs flex-1",
@@ -2480,8 +2551,8 @@
     const t = props.task;
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
-        onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
-        disabled: enabled === false,
+        onClick: function () { if (!props.readOnly && enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
+        disabled: props.readOnly || enabled === false,
         size: "sm",
       }, label);
     };
@@ -2528,9 +2599,9 @@
             key: hc.platform,
             size: "sm",
             title: title,
-            disabled: isBusy || !props.onToggle,
+            disabled: isBusy || props.readOnly || !props.onToggle,
             onClick: function () {
-              if (props.onToggle) props.onToggle(hc.platform, hc.subscribed);
+              if (!props.readOnly && props.onToggle) props.onToggle(hc.platform, hc.subscribed);
             },
             className: hc.subscribed
               ? "hermes-kanban-home-sub hermes-kanban-home-sub--on"

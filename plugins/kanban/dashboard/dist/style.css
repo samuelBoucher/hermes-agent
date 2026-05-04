@@ -9,6 +9,61 @@
   width: 100%;
 }
 
+/* ---- Source/scope truth banner -------------------------------------- */
+
+.hermes-kanban-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--color-border) 85%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+}
+
+.hermes-kanban-scope--readonly {
+  border-color: color-mix(in srgb, #d4b348 50%, var(--color-border));
+  background: color-mix(in srgb, #d4b348 8%, var(--color-card));
+}
+
+.hermes-kanban-scope-title {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-scope-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.25rem 0.75rem;
+}
+
+.hermes-kanban-scope code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--color-foreground);
+  word-break: break-all;
+}
+
+.hermes-kanban-readonly-note {
+  padding: 0.45rem 0.65rem;
+  border: 1px dashed color-mix(in srgb, #d4b348 55%, var(--color-border));
+  border-radius: var(--radius-sm, 0.25rem);
+  color: var(--color-muted-foreground);
+  background: color-mix(in srgb, #d4b348 6%, transparent);
+  font-size: 0.75rem;
+}
+
+.hermes-kanban-readonly-badge {
+  font-size: 0.65rem !important;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 /* ---- Columns layout -------------------------------------------------- */
 
 .hermes-kanban-columns {
@@ -33,6 +88,14 @@
 .hermes-kanban-column--drop {
   border-color: var(--color-ring);
   background: color-mix(in srgb, var(--color-ring) 8%, var(--color-card));
+}
+
+.hermes-kanban-column--readonly {
+  border-style: dashed;
+}
+
+.hermes-kanban-column--readonly .hermes-kanban-card {
+  cursor: pointer;
 }
 
 .hermes-kanban-column-header {
