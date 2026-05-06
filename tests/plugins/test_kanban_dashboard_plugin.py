@@ -786,6 +786,24 @@ def test_read_only_mode_blocks_dashboard_mutations(client):
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="seed", created_by="test")
+        running_id = kb.create_task(conn, title="running", assignee="worker")
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            ("read-only-lock", future, 12345, running_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (running_id, "read-only-lock", future, 12345, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?",
+            (run_id, running_id),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -804,6 +822,11 @@ def test_read_only_mode_blocks_dashboard_mutations(client):
         client.delete("/api/plugins/kanban/links", params={"parent_id": task_id, "child_id": task_id}),
         client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task_id], "priority": 9}),
         client.post("/api/plugins/kanban/dispatch?dry_run=true&max=1"),
+        client.post(f"/api/plugins/kanban/tasks/{running_id}/reclaim", json={}),
+        client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/reassign",
+            json={"profile": "blocked"},
+        ),
     ]
     for response in attempts:
         assert response.status_code == 403, response.text

@@ -860,7 +860,7 @@
   // -------------------------------------------------------------------------
 
   function DiagnosticActionButton(props) {
-    const { action, onExec, busy, extra } = props;
+    const { action, onExec, busy, extra, readOnly } = props;
     const label = (action.suggested ? "\u2606 " : "") + action.label;
     const cls = cn(
       "hermes-kanban-diag-action-btn",
@@ -870,9 +870,10 @@
         action.kind === "unblock") {
       return h("button", {
         className: cls,
-        disabled: busy || (extra && extra.disabled),
-        onClick: function () { onExec(action); },
+        disabled: busy || readOnly || (extra && extra.disabled),
+        onClick: readOnly ? undefined : function () { onExec(action); },
         type: "button",
+        title: readOnly ? "Disabled by dashboard.kanban.read_only_mode" : undefined,
       }, label);
     }
     if (action.kind === "cli_hint") {
@@ -887,8 +888,10 @@
     if (action.kind === "comment") {
       return h("button", {
         className: cls,
-        onClick: function () { onExec(action); },
+        disabled: busy || readOnly,
+        onClick: readOnly ? undefined : function () { onExec(action); },
         type: "button",
+        title: readOnly ? "Disabled by dashboard.kanban.read_only_mode" : undefined,
       }, label);
     }
     if (action.kind === "open_docs") {
@@ -905,7 +908,7 @@
   }
 
   function DiagnosticCard(props) {
-    const { diag, task, boardSlug, assignees, onRefresh } = props;
+    const { diag, task, boardSlug, assignees, onRefresh, readOnly } = props;
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
@@ -913,6 +916,12 @@
 
     const execAction = function (action) {
       if (busy) return;
+      const mutates = action.kind === "reclaim" || action.kind === "reassign" ||
+        action.kind === "unblock" || action.kind === "comment";
+      if (readOnly && mutates) {
+        setMsg({ ok: false, text: "Action disabled by dashboard.kanban.read_only_mode." });
+        return;
+      }
       if (action.kind === "cli_hint") {
         const cmd = (action.payload && action.payload.command) || action.label;
         const fallback = function () { window.prompt("Copy this command:", cmd); };
@@ -1042,7 +1051,7 @@
         : null,
       // Inline reassign picker — only shown when the diagnostic offers
       // a reassign action. Profile list comes from the board payload.
-      reassignAction
+      reassignAction && !readOnly
         ? h("div", { className: "hermes-kanban-diag-reassign-row" },
             h("span", { className: "hermes-kanban-diag-reassign-label" },
               "Reassign to:"),
@@ -1065,6 +1074,7 @@
             action: a,
             onExec: execAction,
             busy: busy,
+            readOnly: readOnly,
             extra: {
               copied: copiedKey === a.label,
               disabled: (a.kind === "reassign" && !reassignProfile),
@@ -1119,6 +1129,7 @@
                 boardSlug: props.boardSlug,
                 assignees: props.assignees,
                 onRefresh: props.onRefresh,
+                readOnly: props.readOnly,
               });
             }),
           )

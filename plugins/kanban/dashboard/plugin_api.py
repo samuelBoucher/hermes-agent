@@ -1072,6 +1072,7 @@ def reclaim_task_endpoint(
     without waiting for the claim TTL. Maps 1:1 to
     ``hermes kanban reclaim <task_id> --reason ...``.
     """
+    _require_writes_enabled()
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1108,6 +1109,7 @@ def reassign_task_endpoint(
     smarter model after the assigned profile keeps hallucinating).
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
+    _require_writes_enabled()
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
