@@ -724,6 +724,7 @@ def test_config_returns_defaults_when_section_missing(client):
     assert data["lane_by_profile"] is True
     assert data["include_archived_by_default"] is False
     assert data["render_markdown"] is True
+    assert data["read_only_mode"] is False
 
 
 def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
@@ -735,6 +736,7 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
         "    lane_by_profile: false\n"
         "    include_archived_by_default: true\n"
         "    render_markdown: false\n"
+        "    read_only_mode: true\n"
     )
     r = client.get("/api/plugins/kanban/config")
     assert r.status_code == 200
@@ -743,6 +745,96 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
     assert data["lane_by_profile"] is False
     assert data["include_archived_by_default"] is True
     assert data["render_markdown"] is False
+    assert data["read_only_mode"] is True
+
+
+def test_config_tolerates_non_dict_dashboard_section(client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text("dashboard: nope\n")
+    r = client.get("/api/plugins/kanban/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["default_tenant"] == ""
+    assert data["read_only_mode"] is False
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    assert board.json()["scope"]["read_only"] is False
+
+
+def test_board_includes_scope_truth_banner_metadata(client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    read_only_mode: true\n"
+    )
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    scope = data["scope"]
+    assert scope["profile"] == "default"
+    assert scope["hermes_home"].endswith(".hermes")
+    assert scope["kanban_db"].endswith("kanban.db")
+    assert scope["db_exists"] is True
+    assert scope["read_only"] is True
+    assert scope["latest_event_id"] == data["latest_event_id"]
+    assert scope["generated_at"] == data["now"]
+
+
+def test_read_only_mode_blocks_dashboard_mutations(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="seed", created_by="test")
+        running_id = kb.create_task(conn, title="running", assignee="worker")
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            ("read-only-lock", future, 12345, running_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (running_id, "read-only-lock", future, 12345, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?",
+            (run_id, running_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    read_only_mode: true\n"
+    )
+
+    attempts = [
+        client.post("/api/plugins/kanban/tasks", json={"title": "blocked create"}),
+        client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "done"}),
+        client.post(f"/api/plugins/kanban/tasks/{task_id}/comments", json={"body": "nope"}),
+        client.post("/api/plugins/kanban/links", json={"parent_id": task_id, "child_id": task_id}),
+        client.delete("/api/plugins/kanban/links", params={"parent_id": task_id, "child_id": task_id}),
+        client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task_id], "priority": 9}),
+        client.post("/api/plugins/kanban/dispatch?dry_run=true&max=1"),
+        client.post(f"/api/plugins/kanban/tasks/{running_id}/reclaim", json={}),
+        client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/reassign",
+            json={"profile": "blocked"},
+        ),
+    ]
+    for response in attempts:
+        assert response.status_code == 403, response.text
+        assert "read-only" in response.json()["detail"]
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    assert board.json()["scope"]["read_only"] is True
 
 
 # ---------------------------------------------------------------------------
