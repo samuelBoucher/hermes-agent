@@ -89,6 +89,65 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
+def test_kanban_notifier_delivers_global_completed_and_blocked_only(tmp_path, monkeypatch):
+    db_path = tmp_path / "global-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        done_id = kb.create_task(conn, title="global done", assignee="worker")
+        blocked_id = kb.create_task(conn, title="global blocked", assignee="worker")
+        crashed_id = kb.create_task(conn, title="global crash noise", assignee="worker")
+        kb.add_global_notify_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="default",
+        )
+        kb.complete_task(conn, done_id, summary="done globally")
+        kb.block_task(conn, blocked_id, reason="needs Sam")
+        kb._append_event(conn, crashed_id, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "default"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [sent["text"] for sent in adapter.sent]
+    assert len(texts) == 2
+    assert any("default" in text and done_id in text and "global done" in text for text in texts)
+    assert any("default" in text and blocked_id in text and "global blocked" in text for text in texts)
+    assert all(crashed_id not in text for text in texts)
+
+
+def test_kanban_notifier_dedupes_global_sub_across_alias_boards(tmp_path, monkeypatch):
+    db_path = tmp_path / "global-shared-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    kb.write_board_metadata("alias-a", name="Alias A")
+    kb.write_board_metadata("alias-b", name="Alias B")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="global alias done", assignee="worker")
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done once")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+
+
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
     db_path = tmp_path / "single-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

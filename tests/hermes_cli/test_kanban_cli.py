@@ -110,6 +110,49 @@ def test_run_slash_rejects_branch_without_worktree(kanban_home):
     out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
     assert "--branch is only valid with --workspace worktree" in out
 
+def test_run_slash_global_notify_subscribe_list_unsubscribe(kanban_home):
+    out = kc.run_slash(
+        "notify-global-subscribe --platform telegram --chat-id chat1 "
+        "--thread-id thread1 --notifier-profile vex"
+    )
+    assert "Subscribed global" in out
+
+    payload = json.loads(kc.run_slash("notify-global-list --json"))
+    assert payload == [
+        {
+            "platform": "telegram",
+            "chat_id": "chat1",
+            "thread_id": "thread1",
+            "user_id": None,
+            "notifier_profile": "vex",
+            "created_at": payload[0]["created_at"],
+            "last_event_id": 0,
+        }
+    ]
+
+    out = kc.run_slash(
+        "notify-global-unsubscribe --platform telegram --chat-id chat1 --thread-id thread1"
+    )
+    assert "Unsubscribed global" in out
+    assert json.loads(kc.run_slash("notify-global-list --json")) == []
+
+
+def test_run_slash_global_notify_subscribe_all_boards(kanban_home):
+    kc.run_slash("boards create alpha")
+
+    out = kc.run_slash(
+        "notify-global-subscribe --all-boards --platform discord --chat-id c1 "
+        "--thread-id th1 --notifier-profile vex"
+    )
+    assert "Subscribed global" in out
+    assert "default" in out
+    assert "alpha" in out
+
+    default_payload = json.loads(kc.run_slash("--board default notify-global-list --json"))
+    alpha_payload = json.loads(kc.run_slash("--board alpha notify-global-list --json"))
+    assert default_payload[0]["platform"] == "discord"
+    assert alpha_payload[0]["platform"] == "discord"
+
 
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
     # Parent then child via --parent
