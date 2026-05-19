@@ -22,6 +22,7 @@ def _ensure_discord_mock():
     discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
     discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
     discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+    discord_mod.ChannelType = SimpleNamespace(public_thread="public_thread", private_thread="private_thread")
     discord_mod.Interaction = object
     discord_mod.Embed = MagicMock
     discord_mod.app_commands = SimpleNamespace(
@@ -325,6 +326,55 @@ class TestIsForumParent:
         adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
         ch = SimpleNamespace(type=11)  # public thread
         assert adapter._is_forum_parent(ch) is False
+
+
+@pytest.mark.asyncio
+async def test_kanban_notification_thread_direct_create_uses_public_thread_type():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(id=222)
+    parent_channel = SimpleNamespace(
+        id=111,
+        create_thread=AsyncMock(return_value=thread),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: parent_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.create_kanban_notification_thread(
+        "111",
+        task_id="t_public",
+        title="visible backlog card",
+        board="vortex",
+    )
+
+    assert result == "222"
+    kwargs = parent_channel.create_thread.await_args.kwargs
+    assert kwargs["type"] == _discord_mod.ChannelType.public_thread
+
+
+@pytest.mark.asyncio
+async def test_slash_thread_direct_create_uses_public_thread_type():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(id=333, send=AsyncMock())
+    parent_channel = SimpleNamespace(
+        id=111,
+        create_thread=AsyncMock(return_value=thread),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(display_name="Sam"),
+        channel=parent_channel,
+    )
+
+    result = await adapter._create_thread(
+        interaction,
+        name="public thread smoke",
+        message="seed",
+    )
+
+    assert result["thread_id"] == "333"
+    kwargs = parent_channel.create_thread.await_args.kwargs
+    assert kwargs["type"] == _discord_mod.ChannelType.public_thread
 
 
 @pytest.mark.asyncio

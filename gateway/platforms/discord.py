@@ -3857,11 +3857,15 @@ class DiscordAdapter(BasePlatformAdapter):
         starter_message = (message or "").strip()
 
         try:
-            thread = await parent_channel.create_thread(
-                name=name,
-                auto_archive_duration=auto_archive_duration,
-                reason=reason,
-            )
+            direct_kwargs: dict[str, Any] = {
+                "name": name,
+                "auto_archive_duration": auto_archive_duration,
+                "reason": reason,
+            }
+            public_thread_type = self._discord_public_thread_type()
+            if public_thread_type is not None:
+                direct_kwargs["type"] = public_thread_type
+            thread = await parent_channel.create_thread(**direct_kwargs)
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -3948,6 +3952,19 @@ class DiscordAdapter(BasePlatformAdapter):
         safe = re.sub(r"\s+", " ", safe)
         return safe[:80] or fallback_safe[:80] or "thread"
 
+    def _discord_public_thread_type(self) -> Optional[Any]:
+        """Return discord.py's public-thread enum when available.
+
+        ``TextChannel.create_thread()`` defaults to private threads when no
+        starter message is supplied. Kanban/global notification streams must
+        be visible as regular public channel threads under the parent backlog
+        channel, so direct parent-channel creation needs this explicit type.
+        """
+        channel_type = getattr(discord, "ChannelType", None)
+        if channel_type is None:
+            return None
+        return getattr(channel_type, "public_thread", None)
+
     async def _create_text_channel_thread(
         self,
         parent_chat_id: str,
@@ -3988,11 +4005,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
+                direct_kwargs: dict[str, Any] = {
+                    "name": thread_name,
+                    "auto_archive_duration": 1440,
+                    "reason": reason,
+                }
+                public_thread_type = self._discord_public_thread_type()
+                if public_thread_type is not None:
+                    direct_kwargs["type"] = public_thread_type
+                thread = await create(**direct_kwargs)
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(
