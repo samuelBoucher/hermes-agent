@@ -948,6 +948,19 @@ CREATE TABLE IF NOT EXISTS kanban_global_notify_subs (
     PRIMARY KEY (platform, chat_id, thread_id)
 );
 
+-- Persist platform-native notification thread mappings created by the gateway.
+-- The board DB scopes the board identity; the key below scopes one task/card
+-- under one subscribed destination (platform + parent chat + parent thread).
+CREATE TABLE IF NOT EXISTS kanban_notification_threads (
+    task_id                TEXT NOT NULL,
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    notification_thread_id TEXT NOT NULL,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -3387,6 +3400,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notification_threads WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -3410,6 +3424,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notification_threads WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -6071,6 +6086,60 @@ def rewind_global_notify_cursor(
             (int(old_cursor), platform, chat_id, thread_id or "", int(claimed_cursor)),
         )
     return cur.rowcount > 0
+
+
+def get_notification_thread(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return the native notification thread mapped to a task/destination."""
+    row = conn.execute(
+        """
+        SELECT notification_thread_id
+          FROM kanban_notification_threads
+         WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+        """,
+        (task_id, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return None
+    value = str(row["notification_thread_id"] or "").strip()
+    return value or None
+
+
+def set_notification_thread(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notification_thread_id: str,
+) -> None:
+    """Persist the native notification thread for a task/destination."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_notification_threads
+                (task_id, platform, chat_id, thread_id, notification_thread_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, platform, chat_id, thread_id)
+            DO UPDATE SET notification_thread_id = excluded.notification_thread_id
+            """,
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                str(notification_thread_id),
+                now,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

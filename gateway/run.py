@@ -4777,7 +4777,15 @@ class GatewayRunner:
                         else:
                             continue
                         metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
+                        if d.get("global") and platform_str == "discord":
+                            metadata = await self._kanban_notification_metadata(
+                                adapter=adapter,
+                                sub=sub,
+                                task_id=task_id,
+                                title=title,
+                                board=board_slug,
+                            )
+                        elif sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
                             "global" if d.get("global") else "task",
@@ -4873,6 +4881,104 @@ class GatewayRunner:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _kanban_notification_metadata(
+        self,
+        *,
+        adapter,
+        sub: dict,
+        task_id: str,
+        title: str,
+        board: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return send metadata for a board-global Kanban notification.
+
+        Discord gets one native thread per task/card under the subscribed
+        parent destination. Thread creation is best-effort: unsupported
+        adapters, permission failures, or DB errors fall back to the original
+        subscription target so the notification is not lost.
+        """
+        metadata: dict[str, Any] = {}
+        fallback_thread_id = sub.get("thread_id") or ""
+        if fallback_thread_id:
+            metadata["thread_id"] = fallback_thread_id
+
+        create_thread = getattr(adapter, "create_kanban_notification_thread", None)
+        if create_thread is None:
+            return metadata
+
+        from hermes_cli import kanban_db as _kb
+
+        def _load_mapping() -> Optional[str]:
+            conn = _kb.connect(board=board)
+            try:
+                return _kb.get_notification_thread(
+                    conn,
+                    task_id=task_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=fallback_thread_id,
+                )
+            finally:
+                conn.close()
+
+        try:
+            mapped_thread_id = await asyncio.to_thread(_load_mapping)
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: failed to load notification thread mapping for %s: %s",
+                task_id,
+                exc,
+            )
+            mapped_thread_id = None
+
+        if mapped_thread_id:
+            metadata["thread_id"] = mapped_thread_id
+            return metadata
+
+        try:
+            created_thread_id = await create_thread(
+                sub["chat_id"],
+                task_id=task_id,
+                title=title,
+                board=board,
+            )
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: notification thread creation failed for %s: %s",
+                task_id,
+                exc,
+                exc_info=True,
+            )
+            return metadata
+
+        if not created_thread_id:
+            return metadata
+
+        def _save_mapping() -> None:
+            conn = _kb.connect(board=board)
+            try:
+                _kb.set_notification_thread(
+                    conn,
+                    task_id=task_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=fallback_thread_id,
+                    notification_thread_id=str(created_thread_id),
+                )
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_save_mapping)
+            metadata["thread_id"] = str(created_thread_id)
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: failed to save notification thread mapping for %s: %s",
+                task_id,
+                exc,
+            )
+        return metadata
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

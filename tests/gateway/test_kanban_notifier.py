@@ -16,6 +16,23 @@ class RecordingAdapter:
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
 
+class RecordingDiscordAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.created_threads = []
+
+    async def create_kanban_notification_thread(self, parent_chat_id, *, task_id, title, board=None):
+        thread_id = f"thread-{task_id}"
+        self.created_threads.append({
+            "parent_chat_id": parent_chat_id,
+            "task_id": task_id,
+            "title": title,
+            "board": board,
+            "thread_id": thread_id,
+        })
+        return thread_id
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -40,6 +57,14 @@ def _make_runner(adapter):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def _make_discord_runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._kanban_sub_fail_counts = {}
     return runner
 
@@ -146,6 +171,43 @@ def test_kanban_notifier_dedupes_global_sub_across_alias_boards(tmp_path, monkey
 
     assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
+
+
+def test_discord_global_kanban_notifications_use_one_thread_per_task(tmp_path, monkeypatch):
+    db_path = tmp_path / "discord-card-threads.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        first_id = kb.create_task(conn, title="first threaded card", assignee="worker")
+        second_id = kb.create_task(conn, title="second threaded card", assignee="worker")
+        kb.add_global_notify_sub(conn, platform="discord", chat_id="parent-channel")
+        kb.complete_task(conn, first_id, summary="first completion")
+        kb._append_event(conn, first_id, kind="blocked", payload={"reason": "blocked after done for test"})
+        kb.complete_task(conn, second_id, summary="second completion")
+    finally:
+        conn.close()
+
+    adapter = RecordingDiscordAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 3
+    sends_by_task = {
+        task_id: [sent for sent in adapter.sent if task_id in sent["text"]]
+        for task_id in (first_id, second_id)
+    }
+    assert [sent["metadata"].get("thread_id") for sent in sends_by_task[first_id]] == [
+        f"thread-{first_id}",
+        f"thread-{first_id}",
+    ]
+    assert [sent["metadata"].get("thread_id") for sent in sends_by_task[second_id]] == [
+        f"thread-{second_id}",
+    ]
+    assert len(adapter.created_threads) == 2
+    assert {created["task_id"] for created in adapter.created_threads} == {first_id, second_id}
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
