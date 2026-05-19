@@ -657,7 +657,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_gsub = sub.add_parser(
         "notify-global-subscribe",
-        help="Subscribe a gateway source to all completed/blocked events on this board",
+        help="Subscribe a gateway source to all created/completed/blocked events on this board",
     )
     p_gsub.add_argument("--platform", required=True)
     p_gsub.add_argument("--chat-id", required=True)

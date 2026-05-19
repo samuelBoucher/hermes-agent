@@ -4519,6 +4519,7 @@ class GatewayRunner:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        GLOBAL_NOTIFY_KINDS = ("created", "completed", "blocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4665,7 +4666,7 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=("completed", "blocked"),
+                                    kinds=GLOBAL_NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -4728,7 +4729,9 @@ class GatewayRunner:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (event_task.assignee if event_task and event_task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "created":
+                            msg = f"＋ {tag}Kanban{board_label} {task_id} created — {title}"
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to

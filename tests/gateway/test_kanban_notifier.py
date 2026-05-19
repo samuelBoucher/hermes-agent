@@ -114,15 +114,13 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
-def test_kanban_notifier_delivers_global_completed_and_blocked_only(tmp_path, monkeypatch):
+def test_kanban_notifier_delivers_global_created_completed_and_blocked_only(tmp_path, monkeypatch):
     db_path = tmp_path / "global-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
     conn = kb.connect()
     try:
-        done_id = kb.create_task(conn, title="global done", assignee="worker")
-        blocked_id = kb.create_task(conn, title="global blocked", assignee="worker")
         crashed_id = kb.create_task(conn, title="global crash noise", assignee="worker")
         kb.add_global_notify_sub(
             conn,
@@ -130,6 +128,9 @@ def test_kanban_notifier_delivers_global_completed_and_blocked_only(tmp_path, mo
             chat_id="chat-1",
             notifier_profile="default",
         )
+        created_id = kb.create_task(conn, title="global created", assignee="worker")
+        done_id = kb.create_task(conn, title="global done", assignee="worker")
+        blocked_id = kb.create_task(conn, title="global blocked", assignee="worker")
         kb.complete_task(conn, done_id, summary="done globally")
         kb.block_task(conn, blocked_id, reason="needs Sam")
         kb._append_event(conn, crashed_id, kind="crashed")
@@ -143,8 +144,11 @@ def test_kanban_notifier_delivers_global_completed_and_blocked_only(tmp_path, mo
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     texts = [sent["text"] for sent in adapter.sent]
-    assert len(texts) == 2
+    assert len(texts) == 5
+    assert any("default" in text and created_id in text and "created" in text for text in texts)
+    assert any("default" in text and done_id in text and "created" in text for text in texts)
     assert any("default" in text and done_id in text and "global done" in text for text in texts)
+    assert any("default" in text and blocked_id in text and "created" in text for text in texts)
     assert any("default" in text and blocked_id in text and "global blocked" in text for text in texts)
     assert all(crashed_id not in text for text in texts)
 
@@ -180,9 +184,9 @@ def test_discord_global_kanban_notifications_use_one_thread_per_task(tmp_path, m
 
     conn = kb.connect()
     try:
+        kb.add_global_notify_sub(conn, platform="discord", chat_id="parent-channel")
         first_id = kb.create_task(conn, title="first threaded card", assignee="worker")
         second_id = kb.create_task(conn, title="second threaded card", assignee="worker")
-        kb.add_global_notify_sub(conn, platform="discord", chat_id="parent-channel")
         kb.complete_task(conn, first_id, summary="first completion")
         kb._append_event(conn, first_id, kind="blocked", payload={"reason": "blocked after done for test"})
         kb.complete_task(conn, second_id, summary="second completion")
@@ -194,7 +198,7 @@ def test_discord_global_kanban_notifications_use_one_thread_per_task(tmp_path, m
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 5
     sends_by_task = {
         task_id: [sent for sent in adapter.sent if task_id in sent["text"]]
         for task_id in (first_id, second_id)
@@ -202,12 +206,33 @@ def test_discord_global_kanban_notifications_use_one_thread_per_task(tmp_path, m
     assert [sent["metadata"].get("thread_id") for sent in sends_by_task[first_id]] == [
         f"thread-{first_id}",
         f"thread-{first_id}",
+        f"thread-{first_id}",
     ]
     assert [sent["metadata"].get("thread_id") for sent in sends_by_task[second_id]] == [
         f"thread-{second_id}",
+        f"thread-{second_id}",
     ]
+    assert any("created" in sent["text"] for sent in sends_by_task[first_id])
+    assert any("created" in sent["text"] for sent in sends_by_task[second_id])
     assert len(adapter.created_threads) == 2
     assert {created["task_id"] for created in adapter.created_threads} == {first_id, second_id}
+
+    conn = kb.connect()
+    try:
+        assert kb.get_notification_thread(
+            conn,
+            task_id=first_id,
+            platform="discord",
+            chat_id="parent-channel",
+        ) == f"thread-{first_id}"
+        assert kb.get_notification_thread(
+            conn,
+            task_id=second_id,
+            platform="discord",
+            chat_id="parent-channel",
+        ) == f"thread-{second_id}"
+    finally:
+        conn.close()
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
