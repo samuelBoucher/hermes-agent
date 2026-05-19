@@ -933,6 +933,21 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-global subscription from a gateway source to every task on this
+-- board. The cursor is intentionally separate from per-task subscriptions so
+-- broad operator notifications do not consume or rewind a task requester's
+-- cursor.
+CREATE TABLE IF NOT EXISTS kanban_global_notify_subs (
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    user_id       TEXT,
+    notifier_profile TEXT,
+    created_at    INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -5886,6 +5901,174 @@ def rewind_notify_cursor(
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
+        )
+    return cur.rowcount > 0
+
+
+def add_global_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Register a gateway source for board-global Kanban notifications.
+
+    Global subscriptions live in each board DB and watch every task event on
+    that board. They use their own cursor table so they never consume or
+    rewind per-task subscription progress.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cursor = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS last_seen FROM task_events"
+        ).fetchone()["last_seen"]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_global_notify_subs
+                (platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (platform, chat_id, thread_id or "", user_id, notifier_profile, now, int(cursor or 0)),
+        )
+
+
+def list_global_notify_subs(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM kanban_global_notify_subs").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_global_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_global_notify_subs "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (platform, chat_id, thread_id or ""),
+        )
+    return cur.rowcount > 0
+
+
+def unseen_events_for_global_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, list[Event]]:
+    """Return ``(new_cursor, events)`` for a board-global subscription."""
+    row = conn.execute(
+        "SELECT last_event_id FROM kanban_global_notify_subs "
+        "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+        (platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return 0, []
+    cursor = int(row["last_event_id"])
+    upper_row = conn.execute(
+        "SELECT COALESCE(MAX(id), ?) AS last_seen FROM task_events WHERE id > ?",
+        (cursor, cursor),
+    ).fetchone()
+    max_id = int(upper_row["last_seen"] if upper_row else cursor)
+    kind_list = list(kinds) if kinds else None
+    q = (
+        "SELECT * FROM task_events WHERE id > ? AND id <= ? "
+        + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+        + "ORDER BY id ASC"
+    )
+    params: list[Any] = [cursor, max_id]
+    if kind_list:
+        params.extend(kind_list)
+    rows = conn.execute(q, params).fetchall()
+    out: list[Event] = []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else None
+        except Exception:
+            payload = None
+        out.append(Event(
+            id=r["id"], task_id=r["task_id"], kind=r["kind"],
+            payload=payload, created_at=r["created_at"],
+            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+        ))
+    return max_id, out
+
+
+def claim_unseen_events_for_global_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen events for one board-global subscription."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_global_notify_subs "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        new_cursor, events = unseen_events_for_global_sub(
+            conn,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            kinds=kinds,
+        )
+        if new_cursor == old_cursor:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(new_cursor), platform, chat_id, thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, new_cursor, events
+
+
+def advance_global_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    new_cursor: int,
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (int(new_cursor), platform, chat_id, thread_id or ""),
+        )
+
+
+def rewind_global_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(old_cursor), platform, chat_id, thread_id or "", int(claimed_cursor)),
         )
     return cur.rowcount > 0
 

@@ -128,6 +128,90 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
 
+def test_global_notify_cursor_is_independent_from_per_task_subscription(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="notify independently", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="chat-1")
+        global_start = kb.list_global_notify_subs(conn)[0]["last_event_id"]
+        kb.complete_task(conn, tid, summary="done")
+
+        task_old, task_cursor, task_events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed"],
+        )
+        global_old, global_cursor, global_events = kb.claim_unseen_events_for_global_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed", "blocked"],
+        )
+
+        task_sub = kb.list_notify_subs(conn, tid)[0]
+        global_sub = kb.list_global_notify_subs(conn)[0]
+
+    assert task_old == 0
+    assert global_old == global_start
+    assert task_cursor == global_cursor
+    assert [ev.task_id for ev in task_events] == [tid]
+    assert [ev.task_id for ev in global_events] == [tid]
+    assert task_sub["last_event_id"] == task_cursor
+    assert global_sub["last_event_id"] == global_cursor
+
+
+def test_global_notify_subscription_starts_after_existing_events(kanban_home):
+    with kb.connect() as conn:
+        historical_id = kb.create_task(conn, title="already done", assignee="worker")
+        kb.complete_task(conn, historical_id, summary="old news")
+        current_event_id = conn.execute("SELECT MAX(id) AS max_id FROM task_events").fetchone()["max_id"]
+
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="chat-1")
+        old_cursor, new_cursor, events = kb.claim_unseen_events_for_global_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed", "blocked"],
+        )
+        sub = kb.list_global_notify_subs(conn)[0]
+
+    assert old_cursor == current_event_id
+    assert new_cursor == current_event_id
+    assert events == []
+    assert sub["last_event_id"] == current_event_id
+
+
+def test_global_notify_claim_advances_past_ignored_events(kanban_home):
+    with kb.connect() as conn:
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="chat-1")
+        noisy_id = kb.create_task(conn, title="spawn noise", assignee="worker")
+
+        old_cursor, noisy_cursor, noisy_events = kb.claim_unseen_events_for_global_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed", "blocked"],
+        )
+
+        done_id = kb.create_task(conn, title="notify me", assignee="worker")
+        kb.complete_task(conn, done_id, summary="new signal")
+        signal_old, signal_cursor, signal_events = kb.claim_unseen_events_for_global_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed", "blocked"],
+        )
+        sub = kb.list_global_notify_subs(conn)[0]
+
+    assert noisy_events == []
+    assert noisy_cursor > old_cursor
+    assert signal_old == noisy_cursor
+    assert [ev.task_id for ev in signal_events] == [done_id]
+    assert all(ev.task_id != noisy_id for ev in signal_events)
+    assert sub["last_event_id"] == signal_cursor
+
 
 # ---------------------------------------------------------------------------
 # Task creation + status inference
