@@ -176,6 +176,119 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+@pytest.mark.asyncio
+async def test_file_upload_methods_route_to_metadata_thread(tmp_path):
+    """Discord file uploads must respect metadata.thread_id, not parent chat_id.
+
+    Kanban card notifications create a per-card thread, then send completion
+    artifacts through send_document/send_video. If those upload paths ignore
+    metadata, files land in the parent #backlog channel while text lands in
+    the thread.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    parent_channel = SimpleNamespace(
+        id=111,
+        type=0,
+        send=AsyncMock(return_value=SimpleNamespace(id=1000)),
+    )
+    thread_channel = SimpleNamespace(
+        id=222,
+        type=11,
+        send=AsyncMock(return_value=SimpleNamespace(id=2000)),
+    )
+
+    def fake_get_channel(channel_id):
+        return {111: parent_channel, 222: thread_channel}.get(int(channel_id))
+
+    adapter._client = SimpleNamespace(
+        get_channel=fake_get_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("done", encoding="utf-8")
+
+    result = await adapter.send_document(
+        "111",
+        str(artifact),
+        metadata={"thread_id": "222"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "2000"
+    assert parent_channel.send.await_count == 0
+    assert thread_channel.send.await_count == 1
+
+    thread_channel.send.reset_mock()
+
+    image_file = tmp_path / "image-file.png"
+    image_file.write_bytes(b"fake image")
+
+    result = await adapter.send_image_file(
+        "111",
+        str(image_file),
+        metadata={"thread_id": "222"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "2000"
+    assert parent_channel.send.await_count == 0
+    assert thread_channel.send.await_count == 1
+
+    thread_channel.send.reset_mock()
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+
+    result = await adapter.send_video(
+        "111",
+        str(video),
+        metadata={"thread_id": "222"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "2000"
+    assert parent_channel.send.await_count == 0
+    assert thread_channel.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_routes_to_metadata_thread(tmp_path):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    parent_channel = SimpleNamespace(
+        id=111,
+        type=0,
+        send=AsyncMock(),
+    )
+    thread_channel = SimpleNamespace(
+        id=222,
+        type=11,
+        send=AsyncMock(return_value=SimpleNamespace(id=2000)),
+    )
+
+    def fake_get_channel(channel_id):
+        return {111: parent_channel, 222: thread_channel}.get(int(channel_id))
+
+    adapter._client = SimpleNamespace(
+        get_channel=fake_get_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"fake image")
+
+    await adapter.send_multiple_images(
+        "111",
+        [(f"file://{image}", "")],
+        metadata={"thread_id": "222"},
+    )
+
+    assert parent_channel.send.await_count == 0
+    assert thread_channel.send.await_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
