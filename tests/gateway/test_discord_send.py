@@ -45,6 +45,22 @@ _ensure_discord_mock()
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 
 
+def test_short_thread_name_strips_discord_mentions():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    name = adapter._short_thread_name(
+        "Kanban — ",
+        "Fix <@123> <@!456> <@&789> <#987> @everyone @here now",
+        "Kanban fallback",
+    )
+
+    assert "Kanban — Fix now" == name
+    assert "<@" not in name
+    assert "<#" not in name
+    assert "@everyone" not in name.lower()
+    assert "@here" not in name.lower()
+
+
 @pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
