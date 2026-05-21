@@ -1,0 +1,7 @@
+name: web-native
+version: 1.0.0
+description: "Native no-key URL content extraction using direct HTTP fetch + stdlib HTML text extraction. Extract-only; no search or crawl."
+author: Vex
+kind: backend
+provides_web_providers:
+  - native

@@ -339,6 +339,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "native":
+        return True
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -872,6 +874,25 @@ async def web_extract_tool(
             )
 
             provider = _wsp_get_provider(backend) if backend else None
+            known_search_only = {
+                "brave-free": "Brave Search (Free)",
+                "ddgs": "DuckDuckGo (ddgs)",
+                "searxng": "SearXNG",
+                "xai": "xAI Web Search (Grok)",
+            }
+            if provider is None and backend in known_search_only:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"{known_search_only[backend]} is a search-only "
+                            "backend and cannot extract URL content. "
+                            "Set web.extract_backend to native, firecrawl, "
+                            "tavily, exa, or parallel."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             if provider is None or not provider.supports_extract():
                 # When the configured name IS registered but doesn't support
                 # extract (search-only providers like brave-free / ddgs /
@@ -886,7 +907,7 @@ async def web_extract_tool(
                             "error": (
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
+                                "Set web.extract_backend to native, firecrawl, "
                                 "tavily, exa, or parallel."
                             ),
                         },
@@ -920,7 +941,7 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
+                                "Set web.extract_backend to native, firecrawl, "
                                 "tavily, exa, or parallel."
                             ),
                         },
