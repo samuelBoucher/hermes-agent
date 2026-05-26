@@ -93,6 +93,94 @@ def test_no_idempotency_key_never_collides(kanban_home):
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
 
+def _install_profile_skill(profile_home: Path, skill_name: str, *, category: str = "devops") -> None:
+    skill_dir = profile_home / "skills" / category / skill_name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill_name}\ndescription: test skill\n---\n\n# {skill_name}\n",
+        encoding="utf-8",
+    )
+
+
+def test_default_spawn_rejects_missing_task_skill_before_popen(kanban_home, monkeypatch, tmp_path):
+    """Per-task skills are hard requirements: fail before launching hermes."""
+    profile_home = kanban_home / "profiles" / "morda"
+    profile_home.mkdir(parents=True)
+    _install_profile_skill(profile_home, "kanban-worker")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="needs local ops skill",
+            assignee="morda",
+            skills=["hermes-local-operations"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    finally:
+        conn.close()
+
+    def _no_popen(*_args, **_kwargs):
+        raise AssertionError("_default_spawn should preflight skills before Popen")
+
+    monkeypatch.setattr(subprocess, "Popen", _no_popen)
+
+    with pytest.raises(kb.MissingTaskSkillError) as exc:
+        kb._default_spawn(task, str(tmp_path))
+
+    message = str(exc.value)
+    assert "morda" in message
+    assert "hermes-local-operations" in message
+
+
+def test_qualified_plugin_skill_names_are_deferred_to_worker(kanban_home):
+    """The parent preflight must not false-block plugin-provided skill names."""
+    missing_for_home = getattr(kb, "_missing_task_skills_for_home")
+    assert missing_for_home(kanban_home, ["plugin:remote-skill"]) == []
+
+
+def test_local_category_qualified_skill_resolves_before_plugin_deferral(kanban_home):
+    """`category:skill` should pass when the target profile has category/skill."""
+    _install_profile_skill(kanban_home, "local-ops", category="devops")
+    missing_for_home = getattr(kb, "_missing_task_skills_for_home")
+    assert missing_for_home(kanban_home, ["devops:local-ops"]) == []
+
+
+def test_missing_task_skill_auto_blocks_without_retrying(kanban_home, monkeypatch, tmp_path):
+    """A deterministic missing skill should block immediately, not crash-loop."""
+    profile_home = kanban_home / "profiles" / "morda"
+    profile_home.mkdir(parents=True)
+    _install_profile_skill(profile_home, "kanban-worker")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="needs local ops skill",
+            assignee="morda",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            skills=["hermes-local-operations"],
+        )
+
+        def _no_popen(*_args, **_kwargs):
+            raise AssertionError("missing skill preflight should prevent Popen")
+
+        monkeypatch.setattr(subprocess, "Popen", _no_popen)
+        res = kb.dispatch_once(conn, failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert tid in res.auto_blocked
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        assert "missing task skill" in (task.last_failure_error or "")
+        assert "hermes-local-operations" in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
 def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawnable):
     """N consecutive spawn failures on the same task → auto_blocked."""
     def _bad_spawn(task, ws):
@@ -3048,6 +3136,8 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
 def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     """Dispatcher argv must carry one `--skills X` pair per task skill,
     in declared order. No skill is auto-loaded anymore."""
+    _install_profile_skill(kanban_home, "translation")
+    _install_profile_skill(kanban_home, "github-code-review")
     captured = {}
 
     class FakeProc:
@@ -3096,6 +3186,8 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
 def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
     """Per-task skills are passed through verbatim — there is no built-in
     kanban skill to dedupe against anymore."""
+    _install_profile_skill(kanban_home, "translation")
+    _install_profile_skill(kanban_home, "github-code-review")
     captured = {}
 
     class FakeProc:
