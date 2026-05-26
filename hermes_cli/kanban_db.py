@@ -7816,7 +7816,7 @@ def _dispatch_once_locked(
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
+                failure_limit=1 if isinstance(exc, MissingTaskSkillError) else failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -7897,7 +7897,7 @@ def _dispatch_once_locked(
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
+                failure_limit=1 if isinstance(exc, MissingTaskSkillError) else failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -8102,6 +8102,153 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+class MissingTaskSkillError(ValueError):
+    """Raised when a task asks a worker profile to preload an unavailable skill."""
+
+
+def _skills_dirs_for_home(hermes_home: Optional[str]) -> list[Path]:
+    """Return the local + configured external skill dirs for a target home.
+
+    This mirrors ``agent.skill_utils.get_external_skills_dirs`` but accepts the
+    child worker's resolved ``HERMES_HOME`` instead of consulting the current
+    process environment. The dispatcher runs under one profile while spawning
+    another, so checking the parent's skill registry would recreate the exact
+    bug this guard is meant to prevent.
+    """
+    base = Path(hermes_home) if hermes_home else (Path.home() / ".hermes")
+    local_skills = base / "skills"
+    result: list[Path] = [local_skills]
+    config_path = base / "config.yaml"
+    if not config_path.exists():
+        return result
+    try:
+        from agent.skill_utils import yaml_load
+
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return result
+    if not isinstance(parsed, dict):
+        return result
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return result
+    raw_dirs = skills_cfg.get("external_dirs")
+    if not raw_dirs:
+        return result
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if not isinstance(raw_dirs, list):
+        return result
+    seen = {local_skills.resolve()} if local_skills.exists() else set()
+    for entry in raw_dirs:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        path = Path(expanded)
+        path = (base / path).resolve() if not path.is_absolute() else path.resolve()
+        if path in seen or not path.is_dir():
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
+
+
+def _skill_available_for_home(hermes_home: Optional[str], skill_name: str) -> bool:
+    """Return true when ``skill_name`` resolves under the worker's home.
+
+    The check intentionally follows the same common lookup shapes as
+    ``tools.skills_tool.skill_view``: direct relative paths, categorized
+    ``category:skill`` fallbacks, recursive directory-name matches, and YAML
+    frontmatter ``name:`` aliases.
+    """
+    name = (skill_name or "").strip()
+    if not name:
+        return True
+
+    local_category_name = None
+    if ":" in name:
+        namespace, _, bare = name.partition(":")
+        if namespace and bare:
+            local_category_name = f"{namespace}/{bare}"
+
+    try:
+        from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files, parse_frontmatter
+    except Exception:
+        is_excluded_skill_path = lambda _path: False  # type: ignore[assignment]
+        iter_skill_index_files = None  # type: ignore[assignment]
+        parse_frontmatter = None  # type: ignore[assignment]
+
+    for skills_root in _skills_dirs_for_home(hermes_home):
+        if not skills_root.is_dir():
+            continue
+        direct_candidates = [skills_root / name]
+        if local_category_name:
+            direct_candidates.append(skills_root / local_category_name)
+        for candidate in direct_candidates:
+            if candidate.is_dir() and (candidate / "SKILL.md").is_file():
+                return True
+            if candidate.with_suffix(".md").is_file():
+                return True
+
+        try:
+            skill_files = (
+                iter_skill_index_files(skills_root, "SKILL.md")
+                if iter_skill_index_files is not None
+                else skills_root.rglob("SKILL.md")
+            )
+            for skill_md in skill_files:
+                if is_excluded_skill_path(skill_md):
+                    continue
+                if skill_md.parent.name == name:
+                    return True
+                if parse_frontmatter is None:
+                    continue
+                try:
+                    frontmatter, _body = parse_frontmatter(
+                        skill_md.read_text(encoding="utf-8")[:2048]
+                    )
+                except Exception:
+                    continue
+                if str(frontmatter.get("name") or "").strip() == name:
+                    return True
+        except OSError:
+            pass
+
+        try:
+            for found_md in skills_root.rglob(f"{name}.md"):
+                if found_md.name != "SKILL.md" and found_md.is_file():
+                    return True
+        except OSError:
+            pass
+
+    # Qualified names may be plugin-provided (`plugin:skill`). Plugin
+    # discovery is profile/runtime scoped and does not live under the flat
+    # skills tree, so a parent-side filesystem preflight would produce false
+    # negatives. Local categorized `category:skill` names were accepted above
+    # when the corresponding `category/skill` directory exists; otherwise defer
+    # qualified names to the child CLI's normal plugin-aware loader.
+    if ":" in name:
+        return True
+    return False
+
+
+def _missing_task_skills_for_home(
+    hermes_home: Optional[str],
+    skills: Optional[Iterable[str]],
+) -> list[str]:
+    missing: list[str] = []
+    seen: set[str] = set()
+    for skill_name in skills or []:
+        skill_name = str(skill_name or "").strip()
+        if not skill_name or skill_name in seen:
+            continue
+        seen.add(skill_name)
+        if not _skill_available_for_home(hermes_home, skill_name):
+            missing.append(skill_name)
+    return missing
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -8244,6 +8391,17 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+
+    missing_task_skills = _missing_task_skills_for_home(env.get("HERMES_HOME"), task.skills)
+    if missing_task_skills:
+        missing = ", ".join(missing_task_skills)
+        raise MissingTaskSkillError(
+            "missing task skill(s) for profile "
+            f"{profile_arg!r}: {missing}. "
+            "Install the skill in that profile, add it via skills.external_dirs, "
+            "remove the per-task --skill, or choose an assignee that can load it."
+        )
+
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),
