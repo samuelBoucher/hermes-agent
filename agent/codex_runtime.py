@@ -271,6 +271,43 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             len(agent._codex_streamed_text_parts), len(assembled),
                         )
                 return final_response
+        except TypeError as exc:
+            # openai-python parses response.completed before yielding it.
+            # Some Codex backend streams have emitted a terminal response with
+            # output=null after already sending output_item.done/text deltas,
+            # which raises "'NoneType' object is not iterable" inside the SDK
+            # parser. Recover from the stream items we already observed.
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            if collected_output_items:
+                logger.debug(
+                    "Codex stream parser saw output=null; recovered %d collected output items. %s",
+                    len(collected_output_items),
+                    agent._client_log_context(),
+                )
+                return SimpleNamespace(output=list(collected_output_items), status="completed")
+            if agent._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(agent._codex_streamed_text_parts)
+                logger.debug(
+                    "Codex stream parser saw output=null; synthesized output from %d text deltas (%d chars). %s",
+                    len(agent._codex_streamed_text_parts),
+                    len(assembled),
+                    agent._client_log_context(),
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    status="completed",
+                )
+            logger.debug(
+                "Codex stream parser saw output=null with no collected output; falling back to create(stream=True). %s",
+                agent._client_log_context(),
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
@@ -414,7 +451,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is not None:
                 # Backfill empty output from collected stream events
                 _out = getattr(terminal_response, "output", None)
-                if isinstance(_out, list) and not _out:
+                if _out is None or (isinstance(_out, list) and not _out):
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)
                         logger.debug(

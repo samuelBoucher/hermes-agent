@@ -896,6 +896,74 @@ class TestCodexStreamCallbacks:
         assert response is fallback_response
         mock_fallback.assert_called_once_with({}, client=mock_client)
 
+    def test_codex_stream_recovers_when_completed_response_output_is_none(self):
+        from run_agent import AIAgent
+
+        collected_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="recovered item")],
+        )
+
+        def broken_stream_iter():
+            yield SimpleNamespace(type="response.output_item.done", item=collected_item)
+            raise TypeError("'NoneType' object is not iterable")
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(return_value=broken_stream_iter())
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = mock_stream
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response.status == "completed"
+        assert response.output == [collected_item]
+
+    def test_codex_stream_synthesizes_text_when_completed_response_output_is_none(self):
+        from run_agent import AIAgent
+
+        def broken_stream_iter():
+            yield SimpleNamespace(type="response.output_text.delta", delta="hello")
+            yield SimpleNamespace(type="response.output_text.delta", delta=" world")
+            raise TypeError("'NoneType' object is not iterable")
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(return_value=broken_stream_iter())
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = mock_stream
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response.status == "completed"
+        assert response.output[0].content[0].text == "hello world"
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
@@ -944,6 +1012,47 @@ class TestCodexStreamCallbacks:
         )
 
         assert touch_calls.count("receiving stream response") == len(events)
+
+    def test_codex_create_stream_fallback_backfills_none_output(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+
+        collected_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="fallback recovered")],
+        )
+        terminal_response = SimpleNamespace(output=None)
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=collected_item),
+            SimpleNamespace(type="response.completed", response=terminal_response),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        response = agent._run_codex_create_stream_fallback(
+            {"model": "test/model", "instructions": "hi", "input": []},
+            client=mock_client,
+        )
+
+        assert response is terminal_response
+        assert response.output == [collected_item]
 
 
 class TestAnthropicStreamCallbacks:
