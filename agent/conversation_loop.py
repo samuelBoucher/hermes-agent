@@ -599,6 +599,14 @@ def run_conversation(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Live transcript visibility: write the current user turn before the
+    # first model call so drak-tail can attach to an active session instead
+    # of staring at message_count=0 until the whole turn exits. The flush is
+    # non-mutating: persist_user_message overrides are applied only to the DB
+    # row, not to the API-facing message list.
+    agent._session_messages = messages
+    agent._flush_messages_to_session_db(messages, conversation_history)
+
     # Main conversation loop
     api_call_count = 0
     final_response = None
@@ -3399,6 +3407,8 @@ def run_conversation(
                             "tool_call_id": tc.id,
                             "content": content,
                         })
+                    agent._session_messages = messages
+                    agent._flush_messages_to_session_db(messages, conversation_history)
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
@@ -3491,6 +3501,8 @@ def run_conversation(
                                 "tool_call_id": tc.id,
                                 "content": tool_result,
                             })
+                        agent._session_messages = messages
+                        agent._flush_messages_to_session_db(messages, conversation_history)
                         continue
                 
                 # Reset retry counter on successful JSON validation
@@ -3662,8 +3674,13 @@ def run_conversation(
                     # to the new session (see preflight compression comment).
                     conversation_history = None
                 
-                # Save session log incrementally (so progress is visible even if interrupted)
+                # Save session progress incrementally so drak-tail sees tool
+                # calls/results while the turn is still running instead of
+                # waiting for the final _persist_session() append. If the
+                # later empty-response recovery rewinds this tail, final
+                # persistence reconciles SQLite via replace_messages().
                 agent._session_messages = messages
+                agent._flush_messages_to_session_db(messages, conversation_history)
                 
                 # Continue loop for next response
                 continue

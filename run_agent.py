@@ -1272,13 +1272,23 @@ class AIAgent:
 
         Ensures conversations are never lost, even on errors or early returns.
         """
-        self._drop_trailing_empty_response_scaffolding(messages)
+        rewrote_tail = self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        if (
+            self._session_db
+            and (
+                rewrote_tail
+                or getattr(self, "_last_flushed_db_idx", 0) > len(messages)
+            )
+            and hasattr(self._session_db, "replace_messages")
+        ):
+            self._replace_messages_in_session_db(messages)
+        else:
+            self._flush_messages_to_session_db(messages, conversation_history)
 
-    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
+    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> bool:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
 
         Also rewinds past any trailing tool-result / assistant(tool_calls) pair
@@ -1308,7 +1318,7 @@ class AIAgent:
         # result. Only runs when scaffolding was actually present — normal
         # conversation tails (real tool loops mid-progress) are untouched.
         if not dropped_scaffolding:
-            return
+            return False
 
         # Drop any trailing tool-result messages
         while (
@@ -1330,6 +1340,29 @@ class AIAgent:
             and messages[-1].get("tool_calls")
         ):
             messages.pop()
+        return True
+
+    def _replace_messages_in_session_db(self, messages: List[Dict]) -> None:
+        """Rewrite SQLite transcript after final cleanup rewinds live-flushed rows.
+
+        Live tailing writes stable progress during a turn. Rare recovery paths
+        (empty-response scaffolding, terminal sentinels) may later decide that
+        the just-flushed tail must be removed to keep the next turn's API
+        sequence valid. In that case an append-only final flush cannot repair
+        SQLite, so replace the session transcript atomically.
+        """
+        if not self._session_db or not hasattr(self._session_db, "replace_messages"):
+            return
+        try:
+            if not self._session_db_created:
+                self._ensure_db_session()
+            session_id = getattr(self, "session_id", None)
+            if not session_id:
+                return
+            self._session_db.replace_messages(session_id, messages)
+            self._last_flushed_db_idx = len(messages)
+        except Exception as e:
+            logger.warning("Session DB replace_messages failed: %s", e)
 
     def _repair_message_sequence(self, messages: List[Dict]) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_message_sequence``."""
@@ -1345,16 +1378,23 @@ class AIAgent:
         """
         if not self._session_db:
             return
-        self._apply_persist_user_message_override(messages)
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
                 self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
-            for msg in messages[flush_from:]:
+            persist_override_idx = getattr(self, "_persist_user_message_idx", None)
+            persist_override = getattr(self, "_persist_user_message_override", None)
+            for msg_idx, msg in enumerate(messages[flush_from:], start=flush_from):
                 role = msg.get("role", "unknown")
-                content = msg.get("content")
+                content: Any = msg.get("content")
+                if (
+                    persist_override is not None
+                    and msg_idx == persist_override_idx
+                    and role == "user"
+                ):
+                    content = persist_override
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.

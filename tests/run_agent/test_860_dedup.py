@@ -81,7 +81,7 @@ class TestFlushDeduplication:
             db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
-
+            session_id = getattr(agent, "session_id")
             conversation_history = []
             messages = [
                 {"role": "user", "content": "hello"},
@@ -89,7 +89,7 @@ class TestFlushDeduplication:
 
             # First flush — 1 message
             agent._flush_messages_to_session_db(messages, conversation_history)
-            rows = db.get_messages(agent.session_id)
+            rows = db.get_messages(session_id)
             assert len(rows) == 1
 
             # Add more messages
@@ -98,8 +98,81 @@ class TestFlushDeduplication:
 
             # Second flush — should write only 2 new messages
             agent._flush_messages_to_session_db(messages, conversation_history)
-            rows = db.get_messages(agent.session_id)
+            rows = db.get_messages(session_id)
             assert len(rows) == 3, f"Expected 3 total messages, got {len(rows)}"
+
+    def test_flush_user_override_does_not_mutate_api_messages(self):
+        """Live DB flush must not rewrite the API-facing user message.
+
+        Voice/multimodal callers sometimes pass an API-only user message plus a
+        clean persisted override. The live pre-call flush happens before the
+        model sees the request, so it must write the override to SQLite without
+        mutating ``messages`` in-place.
+        """
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+            session_id = getattr(agent, "session_id")
+            setattr(agent, "_persist_user_message_idx", 0)
+            setattr(agent, "_persist_user_message_override", "persisted clean text")
+            messages = [{"role": "user", "content": "API-only enriched text"}]
+
+            agent._flush_messages_to_session_db(messages, [])
+
+            assert messages == [{"role": "user", "content": "API-only enriched text"}]
+            rows = db.get_messages(session_id)
+            assert rows[0]["content"] == "persisted clean text"
+
+    def test_persist_replaces_live_flushed_tail_after_empty_recovery(self):
+        """Final cleanup reconciles SQLite when live tail rows are rewound."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+            session_id = getattr(agent, "session_id")
+            messages = [
+                {"role": "user", "content": "run the task"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                                    "function": {"name": "terminal", "arguments": "{}"}}],
+                },
+                {"role": "tool", "content": "{}", "tool_call_id": "call_1"},
+            ]
+
+            # Simulate live tail flush after tool execution.
+            agent._flush_messages_to_session_db(messages, [])
+            assert len(db.get_messages(session_id)) == 3
+
+            # The follow-up model response went empty and recovery scaffolding
+            # is stripped during final persistence, rewinding the tool pair.
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "(empty)",
+                    "_empty_recovery_synthetic": True,
+                },
+                {
+                    "role": "user",
+                    "content": "Please continue after the tool results.",
+                    "_empty_recovery_synthetic": True,
+                },
+            ])
+            agent._persist_session(messages, conversation_history=[])
+
+            rows = db.get_messages(session_id)
+            assert messages == [{"role": "user", "content": "run the task"}]
+            assert len(rows) == 1
+            assert rows[0]["role"] == "user"
+            assert rows[0]["content"] == "run the task"
 
     def test_persist_session_multiple_calls_no_duplication(self):
         """Multiple _persist_session calls don't duplicate DB entries."""
