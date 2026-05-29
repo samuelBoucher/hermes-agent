@@ -181,24 +181,12 @@ def _get_extract_backend() -> str:
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
-    Reads ``web.{capability}_backend`` from config. Explicit backends win even
-    when credentials are missing so the provider can return a precise setup
-    error instead of silently falling back to an unrelated backend.
+    Reads ``web.{capability}_backend`` from config; if set and available,
+    uses it. Otherwise falls through to the shared ``_get_backend()``.
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    known_backends = {
-        "parallel",
-        "firecrawl",
-        "tavily",
-        "exa",
-        "searxng",
-        "brave-free",
-        "ddgs",
-        "native",
-        "xai",
-    }
-    if specific in known_backends:
+    if specific and _is_backend_available(specific):
         return specific
     return _get_backend()
 
