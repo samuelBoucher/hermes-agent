@@ -7,12 +7,37 @@ import os
 from typing import Dict
 
 
+def _xai_oauth_pool_has_token() -> bool:
+    """Return True when the raw xAI OAuth credential pool has a bearer.
+
+    Uses ``read_credential_pool`` directly instead of ``load_pool`` so this
+    availability probe remains read-only: ``load_pool`` may seed, prune, or
+    normalize entries and write ``auth.json``.  Tool registration must not
+    mutate auth state.
+    """
+    try:
+        from hermes_cli.auth import read_credential_pool
+
+        entries = read_credential_pool("xai-oauth")
+    except Exception:
+        return False
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        access_token = str(entry.get("access_token") or entry.get("runtime_api_key") or "").strip()
+        if access_token:
+            return True
+    return False
+
+
 def has_xai_credentials() -> bool:
     """Cheap probe — return True when xAI credentials are *likely* usable.
 
     Deliberately avoids :func:`resolve_xai_http_credentials` so callers in
     hot-paint paths (``hermes tools`` repaint, tool-registration scans,
-    ``WebSearchProvider.is_available()``) don't incur disk locks or — in
+    ``WebSearchProvider.is_available()``) don't incur disk writes or — in
     the OAuth path — a network token refresh. The ABC contract on
     :meth:`agent.web_search_provider.WebSearchProvider.is_available`
     explicitly forbids network calls for exactly this reason.
@@ -20,14 +45,18 @@ def has_xai_credentials() -> bool:
     Resolution order, fast-to-slow:
 
     1. ``XAI_API_KEY`` env var (cheapest; covers explicit-key users).
-    2. ``~/.hermes/auth.json`` has a non-empty ``providers.xai-oauth.tokens.access_token``
-       (single file read, no expiry check, no refresh).
+    2. ``credential_pool.xai-oauth`` has a non-empty OAuth bearer
+       (current ``hermes auth add xai-oauth`` storage shape; read-only).
+    3. ``~/.hermes/auth.json`` has a non-empty ``providers.xai-oauth.tokens.access_token``
+       (legacy singleton shape; single file read, no expiry check, no refresh).
 
     Returns False on any exception so a corrupted auth store can't block
     other availability scans. Truthful refresh + expiry handling happens
     in ``search()`` (or whichever caller actually makes the request).
     """
     if os.environ.get("XAI_API_KEY", "").strip():
+        return True
+    if _xai_oauth_pool_has_token():
         return True
     try:
         from hermes_constants import get_hermes_home
