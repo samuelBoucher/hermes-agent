@@ -1174,15 +1174,70 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+def _active_web_provider_available(capability: str) -> bool:
+    """Return True when the configured provider for a capability is usable.
+
+    Tool-registry gating needs capability-level checks.  A configured search
+    backend can be unavailable or search-only (for example xAI), while
+    ``web.extract_backend`` can still point at a no-key extractor such as
+    ``native``.  Using one shared availability check for both tools hides
+    ``web_extract`` in that split-provider setup.
+    """
+    try:
+        _ensure_web_plugins_loaded()
+        from agent.web_search_registry import (
+            get_active_extract_provider,
+            get_active_search_provider,
+            get_provider as _wsp_get_provider,
+        )
+
+        if capability == "search":
+            backend = _get_search_backend()
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None:
+                provider = get_active_search_provider()
+            supports = provider.supports_search if provider is not None else None
+        elif capability == "extract":
+            backend = _get_extract_backend()
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None:
+                provider = get_active_extract_provider()
+            supports = provider.supports_extract if provider is not None else None
+        else:
+            return False
+
+        if provider is None or supports is None or not supports():
+            return False
+        return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001 — availability probes must be cheap/fail-closed
+        logger.debug("web %s availability check failed: %s", capability, exc)
+        return False
+
+
+def check_web_search_available() -> bool:
+    """Check whether the active web_search provider is available."""
+    return _active_web_provider_available("search")
+
+
+def check_web_extract_available() -> bool:
+    """Check whether the active web_extract provider is available."""
+    return _active_web_provider_available("extract")
+
+
+# Convenience function to check web API credential availability.
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
+    """Check whether the configured API-backed web backend is available.
+
+    Backward-compatible probe for older callers.  Tool registration uses the
+    capability-specific checks above so search and extract can be exposed
+    independently.
+    """
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "native", "xai"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "native", "xai")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
     )
 
 
@@ -1351,7 +1406,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1362,7 +1417,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

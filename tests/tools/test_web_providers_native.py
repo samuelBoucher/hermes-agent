@@ -126,3 +126,54 @@ def test_web_extract_can_use_native_backend(monkeypatch):
     result = json.loads(result_str)
     assert result["results"][0]["title"] == "Example"
     assert "Native works." in result["results"][0]["content"]
+
+
+class _AvailabilityProvider:
+    name = "fake"
+    display_name = "Fake"
+
+    def __init__(self, *, available=True, search=False, extract=False):
+        self._available = available
+        self._search = search
+        self._extract = extract
+
+    def is_available(self):
+        return self._available
+
+    def supports_search(self):
+        return self._search
+
+    def supports_extract(self):
+        return self._extract
+
+
+def test_web_tool_registry_gates_search_and_extract_independently(monkeypatch):
+    """An unavailable/search-only backend must not hide a configured native extractor."""
+    from agent import web_search_registry
+    from tools import web_tools
+
+    unavailable_search = _AvailabilityProvider(available=False, search=True, extract=False)
+    native_extract = _AvailabilityProvider(available=True, search=False, extract=True)
+    providers = {"xai": unavailable_search, "native": native_extract}
+
+    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "xai")
+    monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "native")
+    monkeypatch.setattr(web_search_registry, "get_provider", lambda name: providers.get(name))
+
+    assert web_tools.check_web_search_available() is False
+    assert web_tools.check_web_extract_available() is True
+    assert web_tools.check_web_api_key() is False
+
+
+def test_web_tool_registry_uses_capability_specific_check_functions():
+    from tools import web_tools
+    from tools.registry import registry
+
+    search_entry = registry.get_entry("web_search")
+    extract_entry = registry.get_entry("web_extract")
+
+    assert search_entry is not None
+    assert extract_entry is not None
+    assert search_entry.check_fn is web_tools.check_web_search_available
+    assert extract_entry.check_fn is web_tools.check_web_extract_available
