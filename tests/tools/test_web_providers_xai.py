@@ -85,7 +85,7 @@ class TestXAIProviderIsAvailable:
         assert XAIWebSearchProvider().is_available() is True
 
     def test_available_via_auth_store(self, monkeypatch, tmp_path):
-        """Cheap probe should detect xai-oauth tokens in ~/.hermes/auth.json
+        """Cheap probe should detect legacy xai-oauth tokens in ~/.hermes/auth.json
         without invoking the resolver (which can trigger refresh)."""
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -99,6 +99,90 @@ class TestXAIProviderIsAvailable:
 
         from plugins.web.xai.provider import XAIWebSearchProvider
         assert XAIWebSearchProvider().is_available() is True
+
+    def test_available_via_oauth_credential_pool(self, monkeypatch, tmp_path):
+        """Current `hermes auth add xai-oauth` stores OAuth bearers in the
+        credential pool; the registry probe must see that read-only shape too.
+        """
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "pool1",
+                        "label": "xai oauth",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:xai_pkce",
+                        "access_token": "ya29.fake-pool-token",
+                    }
+                ]
+            },
+        }))
+
+        from plugins.web.xai.provider import XAIWebSearchProvider
+        assert XAIWebSearchProvider().is_available() is True
+
+    def test_tool_definitions_expose_web_search_with_xai_oauth_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for cron/profile contexts using xAI OAuth pool creds:
+        `enabled_toolsets=['web']` must expose both search and native extract.
+        """
+        for key in (
+            "XAI_API_KEY",
+            "EXA_API_KEY",
+            "PARALLEL_API_KEY",
+            "FIRECRAWL_API_KEY",
+            "FIRECRAWL_API_URL",
+            "FIRECRAWL_GATEWAY_URL",
+            "TOOL_GATEWAY_DOMAIN",
+            "TOOL_GATEWAY_USER_TOKEN",
+            "TAVILY_API_KEY",
+            "SEARXNG_URL",
+            "BRAVE_SEARCH_API_KEY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "pool1",
+                        "label": "xai oauth",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:xai_pkce",
+                        "access_token": "ya29.fake-pool-token",
+                    }
+                ]
+            },
+        }))
+
+        import model_tools
+        import tools.web_tools as web_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        model_tools._clear_tool_defs_cache()
+        invalidate_check_fn_cache()
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {"backend": "xai", "search_backend": "xai", "extract_backend": "native"},
+        )
+
+        tool_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["web"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = {tool["function"]["name"] for tool in tool_defs}
+        assert {"web_search", "web_extract"}.issubset(names)
 
     def test_unavailable_when_no_env_and_no_auth_store(self, monkeypatch, tmp_path):
         monkeypatch.delenv("XAI_API_KEY", raising=False)
