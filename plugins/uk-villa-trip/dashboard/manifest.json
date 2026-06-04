@@ -1,0 +1,14 @@
+{
+  "name": "uk-villa-trip",
+  "label": "Voyage UK 2026",
+  "description": "Plan solo UK autour de Villa Park, Londres, Stonehenge, Édimbourg et les Highlands.",
+  "icon": "Map",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/uk-villa-trip",
+    "position": "after:dashboard"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": "dist/style.css"
+}
