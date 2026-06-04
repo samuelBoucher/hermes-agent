@@ -21,7 +21,7 @@
       this.jsId = config.jsId || "uk-villa-trip-leaflet-js";
       this.cssUrl = config.cssUrl || "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
       this.jsUrl = config.jsUrl || "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-      this.cssIntegrity = config.cssIntegrity || "sha256-p4NxAoJBhIINfQPDJWD60x/P9fM5uaD8Zr1EHBVY9rg=";
+      this.cssIntegrity = config.cssIntegrity || "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";
       this.jsIntegrity = config.jsIntegrity || "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";
     }
 
