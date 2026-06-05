@@ -104,8 +104,11 @@ def test_web_extract_can_use_native_backend(monkeypatch):
 
     monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"extract_backend": "native"})
     monkeypatch.setattr(web_tools, "check_auxiliary_model", lambda: False)
+    async def _safe_url(_url):
+        return True
+
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
-    monkeypatch.setattr("tools.web_tools.is_safe_url", lambda url: True)
+    monkeypatch.setattr("tools.web_tools.async_is_safe_url", _safe_url)
     monkeypatch.setattr("plugins.web.native.provider.is_safe_url", lambda url: True)
     monkeypatch.setattr("plugins.web.native.provider.check_website_access", lambda url: None)
 
