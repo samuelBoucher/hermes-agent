@@ -14,6 +14,69 @@ class RecordingAdapter:
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
+    def extract_local_files(self, text):
+        return [], text
+
+
+class ThreadingAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.created_threads = []
+
+    async def create_kanban_notification_thread(
+        self, chat_id, *, task_id, title, board=None
+    ):
+        thread_id = f"thread-{task_id}"
+        self.created_threads.append({
+            "chat_id": chat_id,
+            "task_id": task_id,
+            "title": title,
+            "board": board,
+            "thread_id": thread_id,
+        })
+        return thread_id
+
+
+class FalseResultAdapter(RecordingAdapter):
+    """Adapter whose send() reports failure without raising."""
+
+    def __init__(self, error="simulated send result failure"):
+        super().__init__()
+        self.error = error
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=False, error=self.error)
+
+
+class FalseResultThreadingAdapter(ThreadingAdapter):
+    """Discord-like adapter: maps a card thread, then reports send failure."""
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=False, error="thread send rejected")
+
+
+class ArtifactThreadingAdapter(ThreadingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.documents_uploaded = []
+        self.images_uploaded = []
+
+    async def send_document(self, chat_id, file_path, metadata=None, **_kw):
+        self.documents_uploaded.append({
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "metadata": metadata or {},
+        })
+
+    async def send_multiple_images(self, chat_id, images, metadata=None, **_kw):
+        self.images_uploaded.append({
+            "chat_id": chat_id,
+            "images": images,
+            "metadata": metadata or {},
+        })
+
 
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
@@ -307,3 +370,110 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+def test_global_discord_notifier_creates_and_reuses_card_thread(tmp_path, monkeypatch):
+    """Board-global Discord notifications create one durable thread per card.
+
+    This pins the local Vortex regression: after the gateway watcher refactor,
+    per-task subscriptions still worked, but board-global Discord updates and
+    their card-thread mapping had vanished from the extracted watcher.
+    """
+    db_path = tmp_path / "global-discord.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        kb.add_global_notify_sub(
+            conn,
+            platform="discord",
+            chat_id="channel-1",
+        )
+        tid = kb.create_task(conn, title="restore <@123> @everyone updates", assignee="marek")
+    finally:
+        conn.close()
+
+    adapter = ThreadingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.DISCORD)))
+
+    assert len(adapter.sent) == 1
+    assert "created" in adapter.sent[0]["text"]
+    assert adapter.sent[0]["metadata"] == {"thread_id": f"thread-{tid}"}
+    assert [t["task_id"] for t in adapter.created_threads] == [tid]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_notification_thread(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="channel-1",
+        ) == f"thread-{tid}"
+        kb.complete_task(conn, tid, summary="patched for real")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.DISCORD)))
+
+    assert len(adapter.sent) == 2
+    assert "done" in adapter.sent[1]["text"]
+    assert adapter.sent[1]["metadata"] == {"thread_id": f"thread-{tid}"}
+    assert len(adapter.created_threads) == 1
+
+
+def test_global_discord_notifier_does_not_upload_completion_artifacts(tmp_path, monkeypatch):
+    """Global Discord updates are operator status pings, not file handoffs."""
+    db_path = tmp_path / "global-discord-no-artifacts.db"
+    artifact = tmp_path / "worker-output.pdf"
+    artifact.write_bytes(b"%PDF-fake")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        kb.add_global_notify_sub(conn, platform="discord", chat_id="channel-1")
+        tid = kb.create_task(conn, title="artifact-heavy card", assignee="marek")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="finished with a report",
+            metadata={"artifacts": [str(artifact)]},
+        )
+    finally:
+        conn.close()
+
+    adapter = ArtifactThreadingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.DISCORD)))
+
+    assert len(adapter.sent) == 2
+    assert any("created" in item["text"] for item in adapter.sent)
+    assert any("done" in item["text"] for item in adapter.sent)
+    assert adapter.documents_uploaded == []
+    assert adapter.images_uploaded == []
+
+
+def test_global_notify_cursor_is_independent_from_per_task_sub(tmp_path, monkeypatch):
+    db_path = tmp_path / "global-cursor.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="ops")
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="requester")
+        kb.complete_task(conn, tid, summary="done")
+
+        _, global_events = kb.unseen_events_for_global_sub(
+            conn, platform="telegram", chat_id="ops", kinds=["created", "completed"]
+        )
+        _, task_events = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="requester", kinds=["completed"]
+        )
+    finally:
+        conn.close()
+
+    assert [ev.kind for ev in global_events] == ["created", "completed"]
+    assert [ev.kind for ev in task_events] == ["completed"]

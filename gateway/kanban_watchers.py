@@ -427,9 +427,13 @@ class GatewayKanbanWatchersMixin:
                             # uploads. ``extract_local_files`` finds bare
                             # absolute paths in the summary;
                             # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
+                            # them. Only fires on task-local subscriptions:
+                            # board-global operator notifications are status
+                            # updates, not artifact handoff channels. Letting
+                            # global Discord notifications upload every worker
+                            # artifact flooded the Kanban channel with files
+                            # while the useful text updates were easy to miss.
+                            if kind == "completed" and not d.get("global"):
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
