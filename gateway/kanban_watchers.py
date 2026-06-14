@@ -165,6 +165,7 @@ class GatewayKanbanWatchersMixin:
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        GLOBAL_NOTIFY_KINDS = ("created", "completed", "blocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -249,7 +250,8 @@ class GatewayKanbanWatchersMixin:
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
                             subs = _kb.list_notify_subs(conn)
-                            if not subs:
+                            global_subs = _kb.list_global_notify_subs(conn)
+                            if not subs and not global_subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
@@ -290,6 +292,46 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "global": False,
+                                })
+                            for sub in global_subs:
+                                owner_profile = sub.get("notifier_profile") or None
+                                if owner_profile and owner_profile != notifier_profile:
+                                    logger.debug(
+                                        "kanban notifier: global subscription owned by profile %s; current profile %s skipping",
+                                        owner_profile, notifier_profile,
+                                    )
+                                    continue
+                                platform = (sub.get("platform") or "").lower()
+                                if platform not in active_platforms:
+                                    logger.debug(
+                                        "kanban notifier: global subscription on %s skipped; adapter not connected",
+                                        platform or "<missing>",
+                                    )
+                                    continue
+                                old_cursor, cursor, events = _kb.claim_unseen_events_for_global_sub(
+                                    conn,
+                                    platform=sub["platform"],
+                                    chat_id=sub["chat_id"],
+                                    thread_id=sub.get("thread_id") or "",
+                                    kinds=GLOBAL_NOTIFY_KINDS,
+                                )
+                                if not events:
+                                    continue
+                                logger.debug(
+                                    "kanban notifier: claimed %d global event(s) on board %s cursor %s→%s",
+                                    len(events), slug, old_cursor, cursor,
+                                )
+                                event_tasks = {ev.id: _kb.get_task(conn, ev.task_id) for ev in events}
+                                deliveries.append({
+                                    "sub": dict(sub, task_id="*", _global=True),
+                                    "old_cursor": old_cursor,
+                                    "cursor": cursor,
+                                    "events": events,
+                                    "task": None,
+                                    "tasks": event_tasks,
+                                    "board": slug,
+                                    "global": True,
                                 })
                         finally:
                             conn.close()
@@ -334,16 +376,20 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
-                    board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
+                        event_task = (d.get("tasks") or {}).get(ev.id) or task
+                        task_id = ev.task_id if d.get("global") else sub["task_id"]
+                        title = (event_task.title if event_task else task_id)[:120]
+                        board_label = f"[{board_slug}]" if board_slug else ""
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
+                        who = (event_task.assignee if event_task and event_task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "created":
+                            msg = f"＋ {tag}Kanban{board_label} {task_id} created — {title}"
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -357,30 +403,30 @@ class GatewayKanbanWatchersMixin:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
                                 handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
+                            elif event_task and event_task.result:
+                                lines = event_task.result.strip().splitlines()
+                                r = lines[0][:160] if lines else event_task.result[:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban{board_label} {task_id} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban{board_label} {task_id} blocked — {title}{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban{board_label} {task_id} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban{board_label} {task_id} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -388,14 +434,14 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban{board_label} {task_id} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                            msg = f"🔄 {tag}Kanban{board_label} {task_id} → {new_status}"
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -406,9 +452,19 @@ class GatewayKanbanWatchersMixin:
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
+                        if d.get("global") and platform_str == "discord":
+                            metadata = await self._kanban_notification_metadata(
+                                adapter=adapter,
+                                sub=sub,
+                                task_id=task_id,
+                                title=title,
+                                board=board_slug,
+                            )
+                        elif sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
+                            "global" if d.get("global") else "task",
+                            board_slug or "",
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
@@ -440,7 +496,7 @@ class GatewayKanbanWatchersMixin:
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
-                                        task=task,
+                                        task=event_task,
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
@@ -492,9 +548,16 @@ class GatewayKanbanWatchersMixin:
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = (
+                            not d.get("global")
+                            and task
+                            and task.status in {"done", "archived"}
+                        )
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = {
+                            ev.kind for ev in d["events"]
+                            if not d.get("global") and ev.kind in _WAKE_KINDS
+                        }
                         if _wake_kinds:
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""
@@ -577,6 +640,105 @@ class GatewayKanbanWatchersMixin:
                     return
                 await asyncio.sleep(1)
 
+    async def _kanban_notification_metadata(
+        self,
+        *,
+        adapter,
+        sub: dict,
+        task_id: str,
+        title: str,
+        board: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return send metadata for a board-global Kanban notification.
+
+        Discord gets one native thread per task/card under the subscribed
+        parent destination. Thread creation is best-effort: unsupported
+        adapters, permission failures, or DB errors fall back to the original
+        subscription target so the notification is not lost.
+        """
+        metadata: dict[str, Any] = {}
+        fallback_thread_id = sub.get("thread_id") or ""
+        if fallback_thread_id:
+            metadata["thread_id"] = fallback_thread_id
+
+        create_thread = getattr(adapter, "create_kanban_notification_thread", None)
+        if create_thread is None:
+            return metadata
+
+        from hermes_cli import kanban_db as _kb
+
+        def _load_mapping() -> Optional[str]:
+            conn = _kb.connect(board=board)
+            try:
+                return _kb.get_notification_thread(
+                    conn,
+                    task_id=task_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=fallback_thread_id,
+                )
+            finally:
+                conn.close()
+
+        try:
+            mapped_thread_id = await asyncio.to_thread(_load_mapping)
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: failed to load notification thread mapping for %s: %s",
+                task_id,
+                exc,
+            )
+            mapped_thread_id = None
+
+        if mapped_thread_id:
+            metadata["thread_id"] = mapped_thread_id
+            return metadata
+
+        try:
+            created_thread_id = await create_thread(
+                sub["chat_id"],
+                task_id=task_id,
+                title=title,
+                board=board,
+            )
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: notification thread creation failed for %s: %s",
+                task_id,
+                exc,
+                exc_info=True,
+            )
+            return metadata
+
+        if not created_thread_id:
+            return metadata
+
+        def _save_mapping() -> None:
+            conn = _kb.connect(board=board)
+            try:
+                _kb.set_notification_thread(
+                    conn,
+                    task_id=task_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=fallback_thread_id,
+                    notification_thread_id=str(created_thread_id),
+                )
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_save_mapping)
+            metadata["thread_id"] = str(created_thread_id)
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: failed to save notification thread mapping for %s: %s",
+                task_id,
+                exc,
+            )
+        return metadata
+
+
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
     ) -> None:
@@ -588,14 +750,23 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.advance_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
-            )
+            if sub.get("_global"):
+                _kb.advance_global_notify_cursor(
+                    conn,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    new_cursor=cursor,
+                )
+            else:
+                _kb.advance_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    new_cursor=cursor,
+                )
         finally:
             conn.close()
 
@@ -603,13 +774,21 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.remove_notify_sub(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-            )
+            if sub.get("_global"):
+                _kb.remove_global_notify_sub(
+                    conn,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+            else:
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
         finally:
             conn.close()
 
@@ -624,15 +803,25 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
+            if sub.get("_global"):
+                _kb.rewind_global_notify_cursor(
+                    conn,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=claimed_cursor,
+                    old_cursor=old_cursor,
+                )
+            else:
+                _kb.rewind_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=claimed_cursor,
+                    old_cursor=old_cursor,
+                )
         finally:
             conn.close()
 
