@@ -1264,6 +1264,34 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-global subscription from a gateway source to every task on this
+-- board. The cursor is intentionally separate from per-task subscriptions so
+-- broad operator notifications do not consume or rewind a task requester's
+-- cursor.
+CREATE TABLE IF NOT EXISTS kanban_global_notify_subs (
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    user_id       TEXT,
+    notifier_profile TEXT,
+    created_at    INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, chat_id, thread_id)
+);
+
+-- Persist platform-native notification thread mappings created by the gateway.
+-- The board DB scopes the board identity; the key below scopes one task/card
+-- under one subscribed destination (platform + parent chat + parent thread).
+CREATE TABLE IF NOT EXISTS kanban_notification_threads (
+    task_id                TEXT NOT NULL,
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    notification_thread_id TEXT NOT NULL,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2028,6 +2056,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
+    global_notify_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_global_notify_subs'"
+    ).fetchone() is not None
+    if global_notify_table_exists:
+        global_notify_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_global_notify_subs)")
+        }
+        if "notifier_profile" not in global_notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_global_notify_subs",
+                "notifier_profile",
+                "notifier_profile TEXT",
+            )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2155,6 +2199,15 @@ _REBUILD_SPECS = {
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
+    "kanban_global_notify_subs": (
+        "CREATE TABLE kanban_global_notify_subs ("
+        " platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
+        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
+        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (platform, chat_id, thread_id))",
+        (),
+    ),
 }
 
 
@@ -2163,7 +2216,7 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     info = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if not info:
         return False  # table absent — nothing to rebuild
-    if table == "kanban_notify_subs":
+    if table in {"kanban_notify_subs", "kanban_global_notify_subs"}:
         lei = next((c for c in info if c["name"] == "last_event_id"), None)
         return lei is not None and (lei["type"] or "").upper() != "INTEGER"
     # task_events / task_comments / task_runs: id must be INTEGER and a PK.
@@ -2204,7 +2257,7 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
             conn.execute(create_sql)
             new_cols = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}
-            if table == "kanban_notify_subs":
+            if table in {"kanban_notify_subs", "kanban_global_notify_subs"}:
                 # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
                 shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
                 cols_csv = ", ".join(shared)
@@ -5587,6 +5640,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notification_threads WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -5610,6 +5664,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notification_threads WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -9123,6 +9178,239 @@ def rewind_notify_cursor(
             ),
         )
     return cur.rowcount > 0
+
+
+
+def add_global_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Register a gateway source for board-global Kanban notifications.
+
+    Global subscriptions live in each board DB and watch every task event on
+    that board. They use their own cursor table so they never consume or
+    rewind per-task subscription progress.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cursor = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS last_seen FROM task_events"
+        ).fetchone()["last_seen"]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_global_notify_subs
+                (platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (platform, chat_id, thread_id or "", user_id, notifier_profile, now, int(cursor or 0)),
+        )
+        if notifier_profile:
+            conn.execute(
+                """
+                UPDATE kanban_global_notify_subs
+                   SET notifier_profile = ?
+                 WHERE platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (notifier_profile IS NULL OR notifier_profile = '')
+                """,
+                (notifier_profile, platform, chat_id, thread_id or ""),
+            )
+
+
+def list_global_notify_subs(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM kanban_global_notify_subs").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_global_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_global_notify_subs "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (platform, chat_id, thread_id or ""),
+        )
+    return cur.rowcount > 0
+
+
+def unseen_events_for_global_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, list[Event]]:
+    """Return ``(new_cursor, events)`` for a board-global subscription."""
+    row = conn.execute(
+        "SELECT last_event_id FROM kanban_global_notify_subs "
+        "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+        (platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return 0, []
+    cursor = int(row["last_event_id"])
+    upper_row = conn.execute(
+        "SELECT COALESCE(MAX(id), ?) AS last_seen FROM task_events WHERE id > ?",
+        (cursor, cursor),
+    ).fetchone()
+    max_id = int(upper_row["last_seen"] if upper_row else cursor)
+    kind_list = list(kinds) if kinds else None
+    q = (
+        "SELECT * FROM task_events WHERE id > ? AND id <= ? "
+        + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+        + "ORDER BY id ASC"
+    )
+    params: list[Any] = [cursor, max_id]
+    if kind_list:
+        params.extend(kind_list)
+    rows = conn.execute(q, params).fetchall()
+    out: list[Event] = []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else None
+        except Exception:
+            payload = None
+        out.append(Event(
+            id=r["id"], task_id=r["task_id"], kind=r["kind"],
+            payload=payload, created_at=r["created_at"],
+            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+        ))
+    return max_id, out
+
+
+def claim_unseen_events_for_global_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen events for one board-global subscription."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_global_notify_subs "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        new_cursor, events = unseen_events_for_global_sub(
+            conn,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            kinds=kinds,
+        )
+        if new_cursor == old_cursor:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(new_cursor), platform, chat_id, thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, new_cursor, events
+
+
+def advance_global_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    new_cursor: int,
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+            (int(new_cursor), platform, chat_id, thread_id or ""),
+        )
+
+
+def rewind_global_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_global_notify_subs SET last_event_id = ? "
+            "WHERE platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(old_cursor), platform, chat_id, thread_id or "", int(claimed_cursor)),
+        )
+    return cur.rowcount > 0
+
+
+def get_notification_thread(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return the native notification thread mapped to a task/destination."""
+    row = conn.execute(
+        """
+        SELECT notification_thread_id
+          FROM kanban_notification_threads
+         WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+        """,
+        (task_id, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return None
+    value = str(row["notification_thread_id"] or "").strip()
+    return value or None
+
+
+def set_notification_thread(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notification_thread_id: str,
+) -> None:
+    """Persist the native notification thread for a task/destination."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_notification_threads
+                (task_id, platform, chat_id, thread_id, notification_thread_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, platform, chat_id, thread_id)
+            DO UPDATE SET notification_thread_id = excluded.notification_thread_id
+            """,
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                str(notification_thread_id),
+                now,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

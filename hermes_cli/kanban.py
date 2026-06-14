@@ -743,6 +743,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
 
+    p_gsub = sub.add_parser(
+        "notify-global-subscribe",
+        help="Subscribe a gateway source to all created/completed/blocked events on this board",
+    )
+    p_gsub.add_argument("--platform", required=True)
+    p_gsub.add_argument("--chat-id", required=True)
+    p_gsub.add_argument("--thread-id", default=None)
+    p_gsub.add_argument("--user-id", default=None)
+    p_gsub.add_argument(
+        "--all-boards", action="store_true",
+        help="Register on every active board, deduping aliases that resolve to the same DB",
+    )
+    p_gsub.add_argument(
+        "--notifier-profile", default=None,
+        help="Profile gateway that owns/delivers this subscription (default: active profile)",
+    )
+
+    p_glist = sub.add_parser(
+        "notify-global-list",
+        help="List board-global notification subscriptions",
+    )
+    p_glist.add_argument(
+        "--all-boards", action="store_true",
+        help="List subscriptions across every active board",
+    )
+    p_glist.add_argument("--json", action="store_true")
+
+    p_grm = sub.add_parser(
+        "notify-global-unsubscribe",
+        help="Remove a board-global gateway subscription",
+    )
+    p_grm.add_argument("--platform", required=True)
+    p_grm.add_argument("--chat-id", required=True)
+    p_grm.add_argument("--thread-id", default=None)
+    p_grm.add_argument(
+        "--all-boards", action="store_true",
+        help="Remove from every active board, deduping aliases that resolve to the same DB",
+    )
+
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -994,6 +1033,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
+            "notify-global-subscribe":   _cmd_notify_global_subscribe,
+            "notify-global-list":        _cmd_notify_global_list,
+            "notify-global-unsubscribe": _cmd_notify_global_unsubscribe,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -1025,6 +1067,32 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _active_board_slugs_once() -> list[str]:
+    """Return active board slugs, deduping aliases that resolve to one DB."""
+    try:
+        boards = kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+    seen: set[str] = set()
+    slugs: list[str] = []
+    for meta in boards:
+        slug = meta.get("slug") or kb.DEFAULT_BOARD
+        db_path = meta.get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path
+                else str(kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        slugs.append(slug)
+    return slugs or [kb.DEFAULT_BOARD]
 
 
 # ---------------------------------------------------------------------------
@@ -2578,6 +2646,92 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _cmd_notify_global_subscribe(args: argparse.Namespace) -> int:
+    slugs = (
+        _active_board_slugs_once()
+        if getattr(args, "all_boards", False)
+        else [kb.get_current_board()]
+    )
+    owner = args.notifier_profile or _profile_author()
+    for slug in slugs:
+        with kb.connect_closing(board=slug) as conn:
+            kb.add_global_notify_sub(
+                conn,
+                platform=args.platform,
+                chat_id=args.chat_id,
+                thread_id=args.thread_id,
+                user_id=args.user_id,
+                notifier_profile=owner,
+            )
+    board_note = (
+        f" on {', '.join(slugs)}"
+        if getattr(args, "all_boards", False)
+        else " on this board"
+    )
+    print(
+        f"Subscribed global {args.platform}:{args.chat_id}"
+        + (f":{args.thread_id}" if args.thread_id else "")
+        + f" to created/completed/blocked Kanban events{board_note}"
+    )
+    return 0
+
+
+def _cmd_notify_global_list(args: argparse.Namespace) -> int:
+    slugs = (
+        _active_board_slugs_once()
+        if getattr(args, "all_boards", False)
+        else [kb.get_current_board()]
+    )
+    rows: list[dict] = []
+    for slug in slugs:
+        with kb.connect_closing(board=slug) as conn:
+            for sub in kb.list_global_notify_subs(conn):
+                if getattr(args, "all_boards", False):
+                    sub = dict(sub)
+                    sub["board"] = slug
+                rows.append(sub)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("(no global subscriptions)")
+        return 0
+    for s in rows:
+        board = f"{s['board']:10s}  " if s.get("board") else ""
+        thr = f":{s['thread_id']}" if s.get("thread_id") else ""
+        owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
+        print(
+            f"  {board}global  {s['platform']}:{s['chat_id']}{thr}"
+            f"  (since event {s['last_event_id']}){owner}"
+        )
+    return 0
+
+
+def _cmd_notify_global_unsubscribe(args: argparse.Namespace) -> int:
+    slugs = (
+        _active_board_slugs_once()
+        if getattr(args, "all_boards", False)
+        else [kb.get_current_board()]
+    )
+    removed: list[str] = []
+    for slug in slugs:
+        with kb.connect_closing(board=slug) as conn:
+            ok = kb.remove_global_notify_sub(
+                conn,
+                platform=args.platform,
+                chat_id=args.chat_id,
+                thread_id=args.thread_id,
+            )
+        if ok:
+            removed.append(slug)
+    if not removed:
+        print("(no such global subscription)", file=sys.stderr)
+        return 1
+    board_note = f" from {', '.join(removed)}" if getattr(args, "all_boards", False) else ""
+    print(f"Unsubscribed global {args.platform}:{args.chat_id}{board_note}")
     return 0
 
 
