@@ -1085,6 +1085,9 @@ def _build_no_backend_setup_message() -> str:
 
 def check_image_generation_requirements() -> bool:
     """True if FAL or the explicitly configured image backend is available."""
+    if not _image_generation_enabled():
+        return False
+
     try:
         if check_fal_api_key():
             # Trigger the lazy fal_client import here as the SDK presence
@@ -1233,6 +1236,19 @@ def _read_configured_image_model():
     except Exception as exc:
         logger.debug("Could not read image_gen.model: %s", exc)
     return None
+
+
+def _image_generation_enabled() -> bool:
+    """Return False only when ``image_gen.enabled`` is explicitly disabled."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            return section.get("enabled") is not False
+    except Exception as exc:
+        logger.debug("Could not read image_gen.enabled: %s", exc)
+    return True
 
 
 def _read_configured_image_provider():
@@ -1502,6 +1518,8 @@ def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
     if not prompt:
         return tool_error("prompt is required for image generation")
+    if not _image_generation_enabled():
+        return tool_error("image generation is disabled by config (image_gen.enabled=false)")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
     image_url = args.get("image_url")
     reference_image_urls = args.get("reference_image_urls")

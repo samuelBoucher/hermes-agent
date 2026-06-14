@@ -374,6 +374,12 @@ class TestTextToSpeechToolWithPiper:
 # ---------------------------------------------------------------------------
 
 class TestCheckTtsRequirementsPiper:
+    def test_tts_enabled_false_blocks_requirements(self, monkeypatch):
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"enabled": False, "provider": "edge"})
+        monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: True)
+
+        assert check_tts_requirements() is False
+
     def test_piper_install_satisfies_requirements(self, monkeypatch):
         # Drop every other provider so we can isolate the piper signal.
         monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "piper"})

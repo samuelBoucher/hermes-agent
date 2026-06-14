@@ -311,6 +311,16 @@ class TestModelResolution:
             mid, meta = image_tool._resolve_fal_model()
         assert mid == "fal-ai/flux-2/klein/9b"
 
+    def test_config_enabled_false_disables_requirements(self, image_tool, monkeypatch):
+        with patch("hermes_cli.config.load_config", return_value={"image_gen": {"enabled": False}}):
+            monkeypatch.setattr(image_tool, "check_fal_api_key", lambda: True)
+            assert image_tool.check_image_generation_requirements() is False
+
+    def test_config_enabled_false_blocks_handler(self, image_tool):
+        with patch("hermes_cli.config.load_config", return_value={"image_gen": {"enabled": False}}):
+            result = image_tool._handle_image_generate({"prompt": "blocked"})
+        assert "image_gen.enabled=false" in result
+
     def test_valid_config_model_is_used(self, image_tool):
         with patch("hermes_cli.config.load_config",
                    return_value={"image_gen": {"model": "fal-ai/flux-2-pro"}}):
