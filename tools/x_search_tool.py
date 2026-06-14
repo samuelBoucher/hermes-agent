@@ -48,8 +48,6 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-
 from tools.registry import registry, tool_error
 from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 
@@ -66,6 +64,13 @@ MAX_HANDLES = 10
 # Config
 # ---------------------------------------------------------------------------
 
+def _requests_module():
+    """Import requests lazily so disabled x_search does not touch sockets at import."""
+    import requests
+
+    return requests
+
+
 def _load_x_search_config() -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config
@@ -73,6 +78,11 @@ def _load_x_search_config() -> Dict[str, Any]:
         return load_config().get("x_search", {}) or {}
     except Exception:
         return {}
+
+
+def _x_search_enabled() -> bool:
+    """Return False only when ``x_search.enabled`` is explicitly disabled."""
+    return _load_x_search_config().get("enabled") is not False
 
 
 def _get_x_search_model() -> str:
@@ -132,6 +142,9 @@ def check_x_search_requirements() -> bool:
     auto-refreshes the OAuth access token if it's expiring; a successful
     return therefore implies a usable bearer.
     """
+    if not _x_search_enabled():
+        return False
+
     try:
         creds = resolve_xai_http_credentials()
         return bool(str(creds.get("api_key") or "").strip())
@@ -243,7 +256,7 @@ def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return citations
 
 
-def _http_error_message(exc: requests.HTTPError) -> str:
+def _http_error_message(exc: Any) -> str:
     response = getattr(exc, "response", None)
     if response is None:
         return str(exc)
@@ -282,6 +295,9 @@ def x_search_tool(
 ) -> str:
     if not query or not query.strip():
         return tool_error("query is required for x_search")
+    if not _x_search_enabled():
+        return tool_error("x_search is disabled by config (x_search.enabled=false)")
+    requests = _requests_module()
 
     try:
         api_key, base_url, source = _resolve_xai_bearer()
@@ -327,7 +343,7 @@ def x_search_tool(
 
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
-        response: Optional[requests.Response] = None
+        response: Optional[Any] = None
         for attempt in range(max_retries + 1):
             try:
                 response = requests.post(

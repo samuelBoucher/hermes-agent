@@ -362,6 +362,11 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def _tts_enabled(tts_config: Dict[str, Any]) -> bool:
+    """Return False only when ``tts.enabled`` is explicitly disabled."""
+    return tts_config.get("enabled") is not False
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -2306,6 +2311,9 @@ def text_to_speech_tool(
         return tool_error("Text is required", success=False)
 
     tts_config = _load_tts_config()
+    if not _tts_enabled(tts_config):
+        return tool_error("TTS is disabled by config (tts.enabled=false)", success=False)
+
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
@@ -2615,6 +2623,9 @@ def check_tts_requirements() -> bool:
     explicitly selected backend is checked on its own requirements.
     """
     tts_config = _load_tts_config()
+    if not _tts_enabled(tts_config):
+        return False
+
     provider = _get_provider(tts_config)
     command_config = _resolve_command_provider_config(provider, tts_config)
     if command_config is not None:

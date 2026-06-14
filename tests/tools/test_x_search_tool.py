@@ -81,6 +81,27 @@ def test_x_search_posts_responses_request(monkeypatch):
     assert result["answer"] == "People on X are discussing xAI's latest launch."
 
 
+def test_x_search_enabled_false_blocks_requirements_and_call(monkeypatch):
+    from tools.x_search_tool import check_x_search_requirements, x_search_tool
+
+    monkeypatch.setattr(
+        "tools.x_search_tool._load_x_search_config",
+        lambda: {"enabled": False, "model": "grok-4.20-reasoning"},
+    )
+    monkeypatch.setattr(
+        "tools.x_search_tool.resolve_xai_http_credentials",
+        lambda: {"api_key": "xai-test-key"},
+    )
+    monkeypatch.setattr(
+        "tools.x_search_tool._requests_module",
+        lambda: (_ for _ in ()).throw(AssertionError("requests should stay lazy when disabled")),
+    )
+
+    assert check_x_search_requirements() is False
+    result = json.loads(x_search_tool(query="should not leave host"))
+    assert "x_search.enabled=false" in result["error"]
+
+
 def test_x_search_rejects_conflicting_handle_filters(monkeypatch):
     from tools.x_search_tool import x_search_tool
 

@@ -582,14 +582,30 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
+        provider = str(model_cfg.get("provider") or "").strip()
+        if provider.startswith("custom:"):
+            provider = "custom"
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        api_key = model_cfg.get("api_key") or ""
+        if callable(api_key) or not isinstance(api_key, str):
+            api_key = ""
+        config_context_length = model_cfg.get("context_length")
+        if not isinstance(config_context_length, int) or config_context_length <= 0:
+            config_context_length = None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_providers = None
         from agent.model_metadata import get_model_context_length
-        # Honor explicit `model.context_length` in config.yaml — short-circuits
-        # the OpenRouter /models probe at get_model_context_length step 0, so
-        # non-OpenRouter providers don't pay the ~2-3s OpenRouter fetch at every
-        # CLI startup.  See issue #46620.
-        raw_ctx = model_cfg.get("context_length")
-        config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        return int(get_model_context_length(model_id, config_context_length=config_ctx) or 0)
+        return int(get_model_context_length(
+            model_id,
+            base_url=base_url,
+            api_key=api_key,
+            config_context_length=config_context_length,
+            provider=provider,
+            custom_providers=custom_providers,
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

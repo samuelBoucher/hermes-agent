@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -11,7 +12,7 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
 
-    async def send(self, chat_id, text, metadata=None):
+    async def send(self, chat_id, text, metadata=None) -> object:
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
     def extract_local_files(self, text):
@@ -131,6 +132,32 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def _unseen_global_events(platform="telegram", chat_id="ops"):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_global_sub(
+            conn,
+            platform=platform,
+            chat_id=chat_id,
+            kinds=["created", "completed", "blocked"],
+        )
+        return events
+    finally:
+        conn.close()
+
+
+def _global_cursor(platform="telegram", chat_id="ops"):
+    conn = kb.connect()
+    try:
+        subs = kb.list_global_notify_subs(conn)
+        for sub in subs:
+            if sub["platform"] == platform and sub["chat_id"] == chat_id:
+                return int(sub["last_event_id"])
+    finally:
+        conn.close()
+    raise AssertionError(f"missing global subscription for {platform}/{chat_id}")
+
+
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
     db_path = tmp_path / "shared-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -233,6 +260,26 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_rewinds_task_claim_on_send_result_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """SendResult(success=False) is a failed delivery, same as a raised send."""
+    db_path = tmp_path / "send-result-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FalseResultAdapter()
+
+    caplog.set_level("WARNING", logger="gateway.run")
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+    assert "send failed for" in caplog.text
+    assert "simulated send result failure" in caplog.text
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
@@ -451,6 +498,62 @@ def test_global_discord_notifier_does_not_upload_completion_artifacts(tmp_path, 
     assert any("done" in item["text"] for item in adapter.sent)
     assert adapter.documents_uploaded == []
     assert adapter.images_uploaded == []
+
+
+def test_global_notifier_rewinds_cursor_on_send_result_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """Board-global notifications must not advance their cursor on false SendResult."""
+    db_path = tmp_path / "global-send-result-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="global completion", assignee="marek")
+        kb.add_global_notify_sub(conn, platform="telegram", chat_id="ops")
+        kb.complete_task(conn, tid, summary="done but not delivered")
+    finally:
+        conn.close()
+
+    adapter = FalseResultAdapter(error="global send rejected")
+
+    caplog.set_level("WARNING", logger="gateway.run")
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert [ev.kind for ev in _unseen_global_events()] == ["completed"]
+    assert _global_cursor() == 1
+    assert "global send rejected" in caplog.text
+
+
+def test_global_discord_thread_send_result_failure_rewinds_cursor(tmp_path, monkeypatch, caplog):
+    """A failed send into a mapped Discord card thread is retried, not swallowed."""
+    db_path = tmp_path / "global-discord-thread-send-result-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="thread send failure", assignee="marek")
+        kb.add_global_notify_sub(conn, platform="discord", chat_id="channel-1")
+        kb.complete_task(conn, tid, summary="done but thread rejected")
+    finally:
+        conn.close()
+
+    adapter = FalseResultThreadingAdapter()
+
+    caplog.set_level("WARNING", logger="gateway.run")
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.DISCORD)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"] == {"thread_id": f"thread-{tid}"}
+    assert [
+        ev.kind
+        for ev in _unseen_global_events(platform="discord", chat_id="channel-1")
+    ] == ["completed"]
+    assert _global_cursor(platform="discord", chat_id="channel-1") == 1
+    assert "thread send rejected" in caplog.text
 
 
 def test_global_notify_cursor_is_independent_from_per_task_sub(tmp_path, monkeypatch):
