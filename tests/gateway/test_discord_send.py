@@ -389,6 +389,65 @@ async def test_forum_post_file_creation_failure():
     assert "missing perms" in (result.error or "")
 
 
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_creation_posts_visible_seed_message_first():
+    """Kanban thread creation must leave a breadcrumb in the parent channel."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    thread = SimpleNamespace(id=777)
+    seed_msg = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    parent = SimpleNamespace(
+        id=555,
+        send=AsyncMock(return_value=seed_msg),
+        create_thread=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.create_kanban_notification_thread(
+        "555",
+        task_id="t_live1234",
+        title="visible backlog update",
+        board="vortex",
+    )
+
+    assert result == "777"
+    parent.send.assert_awaited_once()
+    assert "Kanban card on vortex" in parent.send.await_args.args[0]
+    seed_msg.create_thread.assert_awaited_once()
+    parent.create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_creation_falls_back_to_direct_thread_create():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    thread = SimpleNamespace(id=888)
+    parent = SimpleNamespace(
+        id=555,
+        send=AsyncMock(side_effect=RuntimeError("cannot send seed")),
+        create_thread=AsyncMock(return_value=thread),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.create_kanban_notification_thread(
+        "555",
+        task_id="t_fallback",
+        title="direct fallback",
+        board="vortex",
+    )
+
+    assert result == "888"
+    parent.send.assert_awaited_once()
+    parent.create_thread.assert_awaited_once()
+
 # ---------------------------------------------------------------------------
 # Typing indicator task lifecycle
 # ---------------------------------------------------------------------------

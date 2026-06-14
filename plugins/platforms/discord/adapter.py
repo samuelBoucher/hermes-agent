@@ -5471,6 +5471,113 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
             return False
 
+    def _short_thread_name(self, prefix: str, title: str, fallback: str) -> str:
+        raw = f"{prefix}{title or fallback}"
+        fallback_safe = re.sub(r"[\r\n\t]+", " ", fallback or "thread").strip()
+        # Thread names are also echoed into fallback seed messages. Strip raw
+        # Discord mention tokens so a Kanban card title cannot ping people
+        # while the gateway creates the per-card thread.
+        safe = re.sub(r"<@[!&]?\d+>|<#\d+>", "", raw)
+        safe = re.sub(r"@(?:everyone|here)\b", "", safe, flags=re.IGNORECASE)
+        safe = re.sub(r"[\r\n\t]+", " ", safe).strip()
+        safe = re.sub(r"\s+", " ", safe)
+        return safe[:80] or fallback_safe[:80] or "thread"
+
+    async def _create_text_channel_thread(
+        self,
+        parent_chat_id: str,
+        *,
+        thread_name: str,
+        reason: str,
+        seed_text: str,
+        log_label: str,
+    ) -> Optional[str]:
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+
+        try:
+            parent_id = int(parent_chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            parent = self._client.get_channel(parent_id)
+            if parent is None:
+                parent = await self._client.fetch_channel(parent_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] %s thread: cannot resolve parent %s: %s",
+                self.name, log_label, parent_chat_id, exc,
+            )
+            return None
+
+        # DMs, voice channels, and existing threads can't host child threads.
+        if isinstance(parent, getattr(discord, "DMChannel", ())):
+            logger.info(
+                "[%s] %s thread: parent %s is a DM; threads not supported here",
+                self.name, log_label, parent_chat_id,
+            )
+            return None
+
+        # First try: post a seed message in the parent channel and create the
+        # thread from it.  A direct ``TextChannel.create_thread`` can create a
+        # valid thread without any visible parent-channel message, which made
+        # Kanban updates look like they vanished from #backlog even though the
+        # thread received them.  The seed message is the visible breadcrumb.
+        try:
+            send = getattr(parent, "send", None)
+            if send is not None:
+                seed_msg = await send(seed_text)
+                thread = await seed_msg.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+                return str(thread.id)
+        except Exception as seed_error:
+            logger.debug(
+                "[%s] %s thread: seed-message create failed (%s); trying direct create fallback",
+                self.name, log_label, seed_error,
+            )
+
+        # Fallback: create a thread directly on the channel.  This may be less
+        # visible in the parent channel, but preserving delivery is better than
+        # dropping the notification if Discord rejects message-based threading.
+        try:
+            create = getattr(parent, "create_thread", None)
+            if create is not None:
+                thread = await create(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+                return str(thread.id)
+        except Exception as direct_error:
+            logger.warning(
+                "[%s] %s thread: both create paths failed for parent %s: %s",
+                self.name, log_label, parent_chat_id, direct_error,
+            )
+        return None
+
+    async def create_kanban_notification_thread(
+        self,
+        parent_chat_id: str,
+        *,
+        task_id: str,
+        title: str,
+        board: Optional[str] = None,
+    ) -> Optional[str]:
+        """Create a Discord thread for one Kanban card notification stream."""
+        label = f"{task_id} — {title}" if title else task_id
+        thread_name = self._short_thread_name("Kanban — ", label, f"Kanban — {task_id}")
+        board_text = f" on {board}" if board else ""
+        return await self._create_text_channel_thread(
+            parent_chat_id,
+            thread_name=thread_name,
+            reason="Hermes Kanban notification thread",
+            seed_text=f"🧵 Kanban card{board_text}: **{thread_name}**",
+            log_label="Kanban notification",
+        )
     async def create_handoff_thread(
         self,
         parent_chat_id: str,
