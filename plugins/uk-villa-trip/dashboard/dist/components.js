@@ -183,6 +183,16 @@
             h(Hero),
             h(DecisionsSection),
             h(StaticSection, {
+              title: "Plan de match — après sortie du calendrier Premier League",
+              intro: "À faire dimanche 21 juin: transformer le calendrier PL en décisions réversibles. Le but n’est pas d’acheter en panique; c’est de verrouiller la géométrie du voyage et de protéger les options.",
+              items: data.postPremierLeaguePlan,
+            }),
+            h(StaticSection, {
+              title: "Agence de voyage — décision épinglée",
+              intro: "Verdict de travail: pas de full-agence. Garder le voyage DIY, avec consultation ciblée seulement si l’agence apporte une vraie valeur sur les vols open-jaw, le support ou la protection.",
+              items: data.agencyDecision,
+            }),
+            h(StaticSection, {
               title: "Matrice des zones d’hôtels — filtre anti-scam strict",
               intro: "Règle: chambre privée, réception 24h, bons avis solides, proche train/transit, réservation remboursable tôt, réservation directe avec l’hôtel préférée. Booking/Expedia seulement pour repérage ou backup.",
               items: data.hotelZones,

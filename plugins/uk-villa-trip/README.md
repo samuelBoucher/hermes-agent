@@ -8,7 +8,9 @@ The plugin adds a `Voyage UK 2026` dashboard tab with:
 - hotel-zone decision matrix;
 - city anchors;
 - interactive Leaflet/OpenStreetMap route map;
-- two route scenarios depending on Aston Villa's Champions League home fixture window.
+- two route scenarios depending on Aston Villa's Champions League home fixture window;
+- post-Premier-League-fixture-release action plan for Sunday 21 June;
+- pinned travel-agency decision: DIY trip, agency only for targeted flight/support value.
 
 ## Dashboard preview
 

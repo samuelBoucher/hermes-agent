@@ -74,8 +74,27 @@
       ["Hôtels", "réservations remboursables tôt dans toutes les villes pivots", false],
       ["Réservation", "site direct de l’hôtel préféré; Booking.com/Expedia pour repérage/backup", false],
       ["Vols", "YQB si ça a de l’allure; YUL si ça sauve beaucoup d’argent/temps", false],
+      ["Agence", "pas de full-agence; consultation ciblée seulement si elle améliore vols/support/flexibilité", false],
       ["Rythme", "sous-planifié, 1 ancre/jour", false],
       ["Stonehenge", "excursion depuis Londres; York devient optionnel si le calendrier est serré", false],
+    ],
+
+    postPremierLeaguePlan: [
+      ["Dim. 21 juin", "Lire le calendrier PL de Villa", "Identifier les matchs à domicile autour des weekends 10/11, 17/18 et 24/25 octobre. Ne pas panic-buy les vols avant d’avoir vu la géométrie réelle.", true],
+      ["Étape 1", "Choisir le squelette A/B", "Si Villa home tôt: Londres → Birmingham → Édimbourg. Si Villa home tard: Londres → Édimbourg → Birmingham. Garder York optionnel, pas sacré.", true],
+      ["Étape 2", "Poser les filets réversibles", "Réserver des hôtels remboursables à Londres, Birmingham centre/New Street et Édimbourg/Waverley-New Town. Ça protège contre les hausses locales sans te piéger.", true],
+      ["Étape 3", "Surveiller les vols 3–7 jours", "Comparer YQB et YUL vers Londres/Manchester/Birmingham/Édimbourg, idéalement open-jaw. Acheter seulement si le prix et les horaires sont bons.", false],
+      ["Seuil rough", "Vols Canada → UK", "YUL sous ~C$900–1000: bon signal. YQB sous ~C$1100–1300 avec connexions raisonnables: acceptable. C$1400+: attendre sauf routing parfait.", false],
+      ["Gate août", "Finaliser avec la LDC", "Le tirage/calendrier Champions League verrouille le vrai climax Villa Park. Avant ça, garder les hôtels flexibles et éviter les achats foot douteux.", true],
+    ],
+
+    agencyDecision: [
+      ["Verdict", "Pas de voyage full-agence", "Le voyage est fixture-driven, flexible et centré Villa Park; une agence classique risque de lisser ça en forfait plus cher et moins agile.", true],
+      ["Quand ça vaut la peine", "Consultation ciblée pour les vols", "Utile si elle améliore un routing YQB/YUL open-jaw, donne un vrai support en cas de pépin, ou bat le prix direct frais inclus.", false],
+      ["À garder DIY", "Hôtels, trains UK, plan quotidien", "Réserve les hôtels remboursables toi-même; trains plus tard quand la route est fixée; plan volontairement sous-planifié.", false],
+      ["Billets Villa", "Officiel ou autorisé seulement", "Priorité au club, membership/hospitality officielle ou revendeur autorisé vérifiable. Éviter les touts/scalpers: billet void = tragédie premium.", true],
+      ["Questions agence", "Frais, modifs, support, open-jaw", "Demander les frais de service/modification/annulation, qui gère les problèmes, si l’open-jaw est pénalisé, et preuve officielle pour tout billet de match.", false],
+      ["Protection Québec", "FICAV si agence enregistrée", "Un agent québécois enregistré peut ajouter la protection FICAV/OPC sur les services admissibles. Ce n’est pas magique, mais c’est une vraie couche de sécurité.", false],
     ],
 
     hotelZones: [
