@@ -103,7 +103,6 @@ def test_web_extract_can_use_native_backend(monkeypatch):
     from tools import web_tools
 
     monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"extract_backend": "native"})
-    monkeypatch.setattr(web_tools, "check_auxiliary_model", lambda: False)
     async def _safe_url(_url):
         return True
 
@@ -121,7 +120,7 @@ def test_web_extract_can_use_native_backend(monkeypatch):
     register_provider(NativeWebExtractProvider())
     try:
         result_str = asyncio.get_event_loop().run_until_complete(
-            web_tools.web_extract_tool(["https://example.com"], use_llm_processing=False)
+            web_tools.web_extract_tool(["https://example.com"])
         )
     finally:
         _reset_for_tests()
