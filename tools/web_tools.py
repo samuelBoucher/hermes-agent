@@ -171,6 +171,10 @@ def _load_web_config() -> dict:
 _LEGACY_WEB_BACKENDS = frozenset(
     {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
 )
+_SEARCH_CAPABLE_BACKENDS = frozenset(
+    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs"}
+)
+_EXTRACT_CAPABLE_BACKENDS = frozenset({"parallel", "firecrawl", "tavily", "exa", "native"})
 
 
 def _registered_web_provider(backend: str):
@@ -1067,43 +1071,82 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
-def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+def _backend_supports_capability(backend: str, capability: str) -> bool:
+    """Return whether *backend* can serve the requested web capability."""
+    backend = (backend or "").lower().strip()
+    if capability == "search" and backend in _SEARCH_CAPABLE_BACKENDS:
+        return True
+    if capability == "search" and backend == "xai":
+        # xAI search is opt-in only; do not auto-detect it from OAuth/API creds,
+        # but allow it when explicitly configured via web.search_backend/backend.
+        return True
+    if capability == "extract" and backend in _EXTRACT_CAPABLE_BACKENDS:
+        return True
+    provider = _registered_web_provider(backend)
+    if provider is None:
+        return False
+    try:
+        if capability == "search":
+            return bool(provider.supports_search())
+        if capability == "extract":
+            return bool(provider.supports_extract())
+    except Exception as exc:  # noqa: BLE001 — broken providers are unavailable
+        logger.debug("web provider %r capability probe raised: %s", backend, exc)
+    return False
 
-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
-    registry.
-    """
-    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured and _is_backend_available(configured):
+
+def _capability_backend_available(backend: str, capability: str) -> bool:
+    """Return True when *backend* both supports and is available for capability."""
+    return _backend_supports_capability(backend, capability) and _is_backend_available(backend)
+
+
+def _configured_backend_for_capability(capability: str) -> str:
+    cfg = _load_web_config()
+    return (cfg.get(f"{capability}_backend") or cfg.get("backend") or "").lower().strip()
+
+
+def _web_capability_available(capability: str) -> bool:
+    """Capability-specific availability gate for web_search / web_extract."""
+    configured = _configured_backend_for_capability(capability)
+    if configured:
+        return _capability_backend_available(configured, capability)
+
+    candidates = _SEARCH_CAPABLE_BACKENDS if capability == "search" else _EXTRACT_CAPABLE_BACKENDS
+    if any(_capability_backend_available(backend, capability) for backend in candidates):
         return True
-    # Any built-in backend with credentials present. This is a boolean OR, so
-    # unlike _get_backend() the probe order is irrelevant.
-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
-        return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
+
     try:
         from agent.web_search_registry import (
             get_active_search_provider,
             get_active_extract_provider,
         )
 
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
-        )
+        if capability == "search":
+            provider = get_active_search_provider()
+            # Built-in xAI is opt-in only. A profile-local OAuth token should not
+            # make web_search appear unless web.search_backend/backend selects xai.
+            return provider is not None and getattr(provider, "name", "") != "xai"
+        if capability == "extract":
+            return get_active_extract_provider() is not None
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
-        logger.debug("web provider registry availability check failed: %s", exc)
-        return False
+        logger.debug("web provider registry %s availability check failed: %s", capability, exc)
+    return False
+
+
+# Convenience function to check Firecrawl credentials
+def check_web_api_key() -> bool:
+    """Check whether a web search backend is available.
+
+    Historical name kept for compatibility: this is the ``web_search`` gate.
+    ``web_extract`` uses :func:`check_web_extract_api_key` so an extract-only
+    backend such as ``native`` does not accidentally expose ``web_search``.
+    """
+    return _web_capability_available("search")
+
+
+def check_web_extract_api_key() -> bool:
+    """Check whether a web extract backend is available."""
+    return _web_capability_available("extract")
 
 
 if __name__ == "__main__":
@@ -1251,7 +1294,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_api_key,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

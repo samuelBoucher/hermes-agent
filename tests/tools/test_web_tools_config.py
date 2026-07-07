@@ -540,11 +540,16 @@ class TestCheckWebApiKey:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_URL",
+        "BRAVE_SEARCH_API_KEY",
+        "XAI_API_KEY",
     )
 
     def setup_method(self):
         for key in self._ENV_KEYS:
             os.environ.pop(key, None)
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
         self._managed_patchers = [
             patch("tools.web_tools.managed_nous_tools_enabled", return_value=True),
             patch("tools.managed_tool_gateway.managed_nous_tools_enabled", return_value=True),
@@ -563,6 +568,8 @@ class TestCheckWebApiKey:
     def teardown_method(self):
         for key in self._ENV_KEYS:
             os.environ.pop(key, None)
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
         for p in self._managed_patchers:
             p.stop()
 
@@ -609,7 +616,8 @@ class TestCheckWebApiKey:
 
     def test_no_keys_returns_false(self):
         from tools.web_tools import check_web_api_key
-        with patch("tools.web_tools._ddgs_package_importable", return_value=False):
+        with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch("tools.web_tools._peek_nous_access_token", return_value=None):
             assert check_web_api_key() is False
 
     def test_both_keys_returns_true(self):
