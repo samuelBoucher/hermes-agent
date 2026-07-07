@@ -44,6 +44,7 @@ from typing import Any, Callable, Dict, List, Optional
 import yaml
 
 from hermes_cli.config import get_hermes_home
+from gateway.builtin_hooks import register_builtin_hooks
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"
@@ -70,13 +71,11 @@ class HookRegistry:
         return list(self._loaded_hooks)
 
     def _register_builtin_hooks(self) -> None:
-        """Register built-in hooks that are always active.
-
-        Currently empty — no shipped built-in hooks. Kept as the extension
-        point for future always-on gateway hooks so they drop in without
-        re-plumbing discover_and_load().
-        """
-        return
+        """Register built-in hooks that are always active."""
+        try:
+            register_builtin_hooks(self)
+        except Exception as exc:
+            print(f"[hooks] Error loading built-in hooks: {exc}", flush=True)
 
     def discover_and_load(self) -> None:
         """

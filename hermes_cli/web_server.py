@@ -17892,6 +17892,17 @@ def start_server(
 
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
+            if _has_display:
+                def _open():
+                    try:
+                        time.sleep(1.0)
+                        # The dashboard's Kanban plugin is the tab Sam actually
+                        # lives in, so auto-open there instead of the Status page.
+                        webbrowser.open(f"http://{host}:{port}/kanban")
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_open, daemon=True).start()
 
             _write_dashboard_ready_file(actual_port)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
