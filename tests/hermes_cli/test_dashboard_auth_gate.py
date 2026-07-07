@@ -183,6 +183,7 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     registered, the bind fails closed (SystemExit) and auth_required is True.
     """
     from hermes_cli.dashboard_auth import clear_providers
+
     clear_providers()
     _stub_uvicorn_run(monkeypatch)
     web_server.app.state.auth_required = None
@@ -192,6 +193,34 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
             open_browser=False, allow_public=True,
         )
     assert web_server.app.state.auth_required is True
+
+
+def test_start_server_auto_open_targets_kanban(monkeypatch):
+    """Auto-open should land on the Kanban tab, not the dashboard root."""
+    _stub_uvicorn_run(monkeypatch)
+    monkeypatch.setenv("DISPLAY", "1")
+    captured: dict = {}
+
+    def _fake_open(url):
+        captured["url"] = url
+        return True
+
+    class _ImmediateThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+            self.daemon = daemon
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("webbrowser.open", _fake_open)
+    monkeypatch.setattr(web_server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(web_server.time, "sleep", lambda *_a, **_kw: None)
+    web_server.start_server(
+        host="127.0.0.1", port=9119,
+        open_browser=True, allow_public=False,
+    )
+    assert captured["url"] == "http://127.0.0.1:9119/kanban"
 
 
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):

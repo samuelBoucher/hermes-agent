@@ -201,6 +201,45 @@ class TestEmit:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_builtin_dashboard_autostart_spawns_dashboard(self, tmp_path, monkeypatch):
+        from gateway.builtin_hooks import dashboard_autostart as da
+
+        reg = HookRegistry()
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", tmp_path / "missing")
+        monkeypatch.setattr(da, "_dashboard_is_up", lambda: False)
+        calls = []
+
+        def _fake_popen(*args, **kwargs):
+            calls.append((args, kwargs))
+            return object()
+
+        monkeypatch.setattr(da.subprocess, "Popen", _fake_popen)
+
+        reg.discover_and_load()
+        assert any(h["name"] == "dashboard-autostart" for h in reg.loaded_hooks)
+
+        await reg.emit("gateway:startup", {"platforms": []})
+        assert len(calls) == 1
+        assert calls[0][0][0] == da.DASHBOARD_CMD
+        assert calls[0][1]["start_new_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_builtin_dashboard_autostart_can_be_disabled(self, tmp_path, monkeypatch):
+        from gateway.builtin_hooks import dashboard_autostart as da
+
+        reg = HookRegistry()
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", tmp_path / "missing")
+        monkeypatch.setenv("HERMES_DISABLE_DASHBOARD_AUTOSTART", "1")
+        monkeypatch.setattr(da, "_dashboard_is_up", lambda: False)
+
+        calls = []
+        monkeypatch.setattr(da.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+
+        reg.discover_and_load()
+        await reg.emit("gateway:startup", {})
+        assert calls == []
+
+    @pytest.mark.asyncio
     async def test_emit_default_context(self, tmp_path):
         captured = []
 
