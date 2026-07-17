@@ -1311,7 +1311,6 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
-_SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Bounded acquire for the cross-process init lock (#36644). The original bare
@@ -1353,6 +1352,25 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    return conn
+
+
+def _open_initialized_connection(path: Path) -> sqlite3.Connection:
+    """Open and configure a connection for a path initialized in this process."""
+    conn = _sqlite_connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        with _INIT_LOCK:
+            from hermes_state import apply_wal_with_fallback
+            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA wal_autocheckpoint=100")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA secure_delete=ON")
+            conn.execute("PRAGMA cell_size_check=ON")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -1525,55 +1543,31 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
-def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
-    """Return True for a TLS record header at ``data[offset:]``."""
-    if len(data) < offset + 5:
-        return False
-    content_type = data[offset]
-    major = data[offset + 1]
-    minor = data[offset + 2]
-    length = int.from_bytes(data[offset + 3:offset + 5], "big")
-    return (
-        content_type in {0x14, 0x15, 0x16, 0x17}
-        and major == 0x03
-        and minor in {0x00, 0x01, 0x02, 0x03, 0x04}
-        and 0 < length <= 18432
-    )
-
-
 def _validate_sqlite_header(path: Path) -> None:
-    """Fail early with an actionable error for non-SQLite Kanban DB files.
+    """Fail early for non-SQLite Kanban DB files through SQLite's VFS.
 
-    ``sqlite3.connect()`` creates missing and zero-byte files, so those are
-    allowed. Existing non-empty files must have the SQLite header before we
-    hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
-    being collapsed into a generic PRAGMA error and lets the gateway's corrupt
-    board handling identify the board by fingerprint.
+    Missing and zero-byte files are valid fresh-board inputs. Existing files
+    are probed through SQLite instead of raw ``open/read/close`` calls: on
+    POSIX, closing an unrelated descriptor for a live database can release the
+    process's advisory locks and allow a concurrent writer through.
     """
     try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return
+        if not path.exists() or path.stat().st_size == 0:
+            return
     except OSError:
-        return
-    if stat.st_size == 0:
         return
     try:
-        with path.open("rb") as handle:
-            head = handle.read(64)
-    except OSError:
-        return
-    if head.startswith(_SQLITE_HEADER):
-        return
-    signature = ""
-    if head.startswith(b"SQLit") and _looks_like_tls_record_at(head, 5):
-        signature = " (TLS record header detected at byte offset 5)"
-    elif _looks_like_tls_record_at(head, 0):
-        signature = " (TLS record header detected at byte offset 0)"
-    raise sqlite3.DatabaseError(
-        "file is not a database: invalid SQLite header for "
-        f"{path}{signature}; first_32={head[:32].hex(' ')}"
-    )
+        probe = _sqlite_connect(path)
+        try:
+            probe.execute("PRAGMA schema_version").fetchone()
+        finally:
+            probe.close()
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise sqlite3.DatabaseError(
+            f"file is not a database: SQLite rejected the header for {path}: {exc}"
+        ) from exc
 
 
 class KanbanDbCorruptError(RuntimeError):
@@ -1748,25 +1742,17 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
-        try:
-            conn.row_factory = sqlite3.Row
-            with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                conn.execute("PRAGMA foreign_keys=ON")
-                conn.execute("PRAGMA secure_delete=ON")
-                conn.execute("PRAGMA cell_size_check=ON")
-        except Exception:
-            conn.close()
-            raise
-        return conn
+        return _open_initialized_connection(path)
 
     with _cross_process_init_lock(path):
-        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-        # and other invalid-header cases without opening a sqlite connection.
+        # A second same-process contender can have observed the cold cache
+        # before the first initializer populated it. Re-check after waiting so
+        # it does not repeat the VFS header/integrity probes or migrations while
+        # the first connection is already serving the board.
+        if resolved in _INITIALIZED_PATHS:
+            return _open_initialized_connection(path)
+        # VFS-backed header check catches #29507-style page-0 clobbers before
+        # WAL setup without bypassing SQLite's lock bookkeeping.
         _validate_sqlite_header(path)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
@@ -2286,45 +2272,6 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         raise
 
 
-def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
-
-    Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
-    """
-    try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        if row is None:
-            return
-        path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
-            return  # in-memory or unnamed DB; skip
-        path = path_str
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
-            raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
-            )
-    except sqlite3.DatabaseError:
-        raise
-    except Exception:
-        pass  # I/O errors during check are non-fatal; let normal ops continue
-
-
 # SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
 # writers re-collide in lockstep under a stampede. A jittered retry on the
 # transaction boundary breaks that convoy. Mirrors state.db's _execute_write:
@@ -2392,9 +2339,6 @@ def write_txn(conn: sqlite3.Connection):
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
 
 
 # ---------------------------------------------------------------------------
