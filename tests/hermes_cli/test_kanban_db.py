@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing as mp
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -36,6 +38,34 @@ def _init_git_repo(repo: Path) -> None:
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+
+
+def _probe_posix_lock(path: str, ready, retry, result) -> None:
+    """Report whether a child can take byte 0's advisory lock on ``path``."""
+    import fcntl
+
+    fd = os.open(path, os.O_RDWR)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+        except BlockingIOError:
+            result.put("blocked-before")
+        else:
+            result.put("acquired-before")
+            return
+        ready.set()
+        if not retry.wait(10):
+            result.put("retry-timeout")
+            return
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+        except BlockingIOError:
+            result.put("blocked-after")
+        else:
+            result.put("acquired-after")
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, 0)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +137,7 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
 
 
 def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
-    """Kanban should classify TLS-looking page-0 clobbers before WAL setup."""
+    """Kanban rejects page-0 clobbers through SQLite's own VFS path."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -123,8 +153,7 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
 
     msg = str(exc_info.value)
     assert "file is not a database" in msg
-    assert "TLS record header detected at byte offset 5" in msg
-    assert "53 51 4c 69 74 17 03 03 00 13" in msg
+    assert "SQLite rejected the header" in msg
 
 
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
@@ -4642,7 +4671,7 @@ def test_write_txn_preserves_original_exception_when_rollback_fails(kanban_home)
         f"OperationalError; got {msg!r}"
     )
 def test_write_txn_healthy_commit_no_exception(tmp_path):
-    """Normal commit does not trigger the torn-extend check."""
+    """Normal write transactions commit and persist their row."""
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
@@ -4657,53 +4686,75 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_raises_on_truncated_file(tmp_path):
-    """A mocked smaller file size triggers the torn-extend check."""
-    from hermes_cli.kanban_db import connect, write_txn
-    db = tmp_path / "test.db"
-    conn = connect(db_path=db)
-    # Get actual page size so we can fake a smaller file
-    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    original_getsize = os.path.getsize
+def test_write_txn_preserves_posix_lock_while_sibling_thread_has_sqlite_connection(tmp_path):
+    """A transaction must not raw-close the DB and drop process advisory locks.
 
-    def fake_getsize(path):
-        # Return a size that implies at least 1 fewer page than header claims
-        real_size = original_getsize(path)
-        return max(0, real_size - page_size)
+    POSIX releases all fcntl record locks for a file when *any* descriptor for
+    that file closes in the locking process.  The child process holds the
+    cross-process observation; the writer thread keeps its SQLite connection
+    open after commit so a raw DB probe is the only operation that can release
+    byte 0's unrelated parent lock.
+    """
+    if os.name != "posix":
+        pytest.skip("POSIX fcntl lock semantics required")
+    import fcntl
 
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
-            with write_txn(conn) as c:
-                c.execute(
-                    "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                    "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+    db = tmp_path / "posix-close.db"
+    seed = kb.connect(db_path=db)
+    seed.close()
+
+    lock_fd = os.open(db, os.O_RDWR)
+    fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    retry = ctx.Event()
+    result = ctx.Queue()
+    child = ctx.Process(target=_probe_posix_lock, args=(str(db), ready, retry, result))
+    writer_done = threading.Event()
+    release_writer = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def writer() -> None:
+        conn = None
+        try:
+            conn = kb.connect(db_path=db)
+            with kb.write_txn(conn) as txn:
+                txn.execute(
+                    "INSERT INTO tasks (id, title, status, priority, created_at) "
+                    "VALUES ('t_posix01', 'lock regression', 'todo', 0, 1)"
                 )
-    conn.close()
+            writer_done.set()
+            release_writer.wait(10)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+            writer_done.set()
+        finally:
+            if conn is not None:
+                conn.close()
 
+    thread = threading.Thread(target=writer)
+    try:
+        child.start()
+        assert ready.wait(5)
+        assert result.get(timeout=5) == "blocked-before"
 
-def test_write_txn_post_commit_check_fires_every_call(tmp_path):
-    """The invariant check runs on every write_txn call."""
-    from hermes_cli.kanban_db import connect, write_txn
-    import hermes_cli.kanban_db as kanban_db_module
-    db = tmp_path / "test.db"
-    conn = connect(db_path=db)
-    call_count = 0
-    real_check = kanban_db_module._check_file_length_invariant
+        thread.start()
+        assert writer_done.wait(10)
+        assert writer_errors == []
 
-    def counting_check(c):
-        nonlocal call_count
-        call_count += 1
-        real_check(c)
-
-    with unittest.mock.patch.object(kanban_db_module, "_check_file_length_invariant", counting_check):
-        for i in range(3):
-            with write_txn(conn) as c:
-                c.execute(
-                    f"INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                    f"VALUES ('t_fire{i:02d}', 'task {i}', 'tester', 'todo', 0, 1234567890)"
-                )
-    assert call_count == 3
-    conn.close()
+        retry.set()
+        assert result.get(timeout=5) == "blocked-after"
+    finally:
+        retry.set()
+        release_writer.set()
+        thread.join(timeout=10)
+        if child.is_alive():
+            child.join(timeout=10)
+        if child.is_alive():  # pragma: no cover - defensive cleanup
+            child.terminate()
+            child.join(timeout=5)
+        fcntl.lockf(lock_fd, fcntl.LOCK_UN, 1, 0)
+        os.close(lock_fd)
 
 
 def test_connect_sets_wal_autocheckpoint_100(tmp_path):
@@ -4714,35 +4765,6 @@ def test_connect_sets_wal_autocheckpoint_100(tmp_path):
     val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
     assert val == 100
     conn.close()
-
-
-def test_write_txn_check_reads_correct_header_fields(tmp_path):
-    """Synthetic DB file with mismatched header page_count triggers the check."""
-    import struct
-    from hermes_cli.kanban_db import connect, _check_file_length_invariant
-    db = tmp_path / "synthetic.db"
-    conn = connect(db_path=db)
-    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    conn.close()
-    # Now corrupt the file: claim N pages but truncate to N-1 pages
-    with open(db, "rb") as f:
-        data = bytearray(f.read())
-    # Read current page_count from header bytes 28-31
-    real_page_count = struct.unpack(">I", data[28:32])[0]
-    if real_page_count < 2:
-        # Need at least 2 pages to fake a truncation
-        pytest.skip("DB too small for synthetic truncation test")
-    # Truncate to N-1 pages
-    truncated = bytes(data[: (real_page_count - 1) * page_size])
-    with open(db, "wb") as f:
-        f.write(truncated)
-    # Now open and check — should raise
-    # We can't use connect() because _validate_sqlite_header may block; use a raw connection
-    raw_conn = sqlite3.connect(str(db), isolation_level=None)
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        _check_file_length_invariant(raw_conn)
-    raw_conn.close()
-
 
 # ---------------------------------------------------------------------------
 # reap_worker_zombies() tests
