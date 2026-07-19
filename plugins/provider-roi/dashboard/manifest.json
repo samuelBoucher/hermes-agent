@@ -1,0 +1,11 @@
+{
+  "name": "provider-roi",
+  "label": "Provider ROI",
+  "description": "Provider-first ROI, delivery, quota and cancellation review.",
+  "icon": "BarChart3",
+  "version": "0.1.0",
+  "tab": {"path": "/provider-roi", "position": "after:analytics"},
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
