@@ -22,7 +22,7 @@ def store_path(home: Path | None = None) -> Path:
 
 def default_state() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "providers": {},
         "exceptions": {},
         "manual_quotas": {},
@@ -30,6 +30,7 @@ def default_state() -> dict[str, Any]:
         "observations": {},
         "monthly_usage": {},
         "unattributed": {},
+        "legacy_baseline_unavailable": False,
     }
 
 
@@ -87,14 +88,20 @@ def _read_state(state_path: Path, directory_fd: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         return default_state()
     state = default_state()
-    # Version one deliberately has no observation history: retaining its old
-    # monthly numbers would fabricate attribution, so only safe local config is
-    # migrated. The next observation starts new, explicitly partial coverage.
-    if value.get("schema_version") not in {1, 2}:
+    version = value.get("schema_version")
+    if version == 3:
+        for key, default in state.items():
+            if isinstance(value.get(key), type(default)):
+                state[key] = value[key]
         return state
-    for key, default in state.items():
-        if isinstance(value.get(key), type(default)):
-            state[key] = value[key]
+    if version in {1, 2}:
+        # Older stores have no per-month baseline metadata. Their aggregates and
+        # snapshots cannot prove current-month attribution, so retain only local
+        # configuration and force subsequent observations to start unavailable.
+        for key in ("providers", "exceptions", "manual_quotas"):
+            if isinstance(value.get(key), dict):
+                state[key] = value[key]
+        state["legacy_baseline_unavailable"] = True
     return state
 
 

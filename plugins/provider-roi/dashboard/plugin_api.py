@@ -24,13 +24,19 @@ MAX_TEXT = 500
 class PlanUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    amount: float = Field(ge=0, le=1_000_000, allow_inf_nan=False)
-    currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Z]{3}$")
+    amount: float | None = Field(default=None, ge=0, le=1_000_000, allow_inf_nan=False)
+    currency: str | None = Field(default=None, min_length=3, max_length=3, pattern=r"^[A-Z]{3}$")
     monthly_cost_cad: float = Field(ge=0, le=1_000_000, allow_inf_nan=False)
     cost_status: Literal["estimated", "confirmed"]
     renewal_on: date | None = None
     status: Literal["active", "trial", "cancellation-planned"]
     note: str = Field(default="", max_length=MAX_TEXT)
+
+    @model_validator(mode="after")
+    def check_original_pair(self) -> "PlanUpdate":
+        if (self.amount is None) != (self.currency is None):
+            raise ValueError("original amount and currency must be provided together, or both omitted")
+        return self
 
 
 class StoreUpdate(BaseModel):
