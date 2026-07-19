@@ -172,6 +172,12 @@ def test_configured_external_only_provider_appears_with_zero_usage_and_plan(plug
     assert provider["rule"]["plan"] == plan
 
 
+def test_plan_editor_accepts_fractional_currency_amounts():
+    source = (PLUGIN_PATH.parent / "dist" / "index.js").read_text()
+    assert 'id: "roi-plan-amount", type: "number", min: 0, step: "0.01"' in source
+    assert 'id: "roi-plan-cad", type: "number", min: 0, step: "0.01"' in source
+
+
 @pytest.mark.parametrize("payload", [
     {"kind": "exception", "provider": "anthropic", "reason": "x" * 501, "expires_on": "2026-08-01"},
     {"kind": "exception", "provider": "anthropic", "reason": "x", "expires_on": "2026-02-30"},
