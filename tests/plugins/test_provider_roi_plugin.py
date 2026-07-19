@@ -1,8 +1,11 @@
-"""Behavior tests for the Provider ROI dashboard plugin."""
+"""Behavior and safety tests for the Provider ROI dashboard plugin."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import os
 import sqlite3
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +13,6 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
 
 PLUGIN_PATH = Path(__file__).resolve().parents[2] / "plugins" / "provider-roi" / "dashboard" / "plugin_api.py"
 
@@ -30,117 +32,178 @@ def plugin(tmp_path, monkeypatch):
     return module, home
 
 
-def _usage_db(home: Path, rows: list[tuple[str, str, int, float, float]]):
+def _usage_db(home: Path, *, provider: str = "anthropic", calls: int = 0, estimated: float = 0, actual: float = 0, status: str = "estimated") -> None:
     conn = sqlite3.connect(home / "state.db")
     conn.execute("""CREATE TABLE session_model_usage (
-        billing_provider TEXT, model TEXT, task TEXT, api_call_count INTEGER,
+        session_id TEXT, billing_provider TEXT, model TEXT, task TEXT, api_call_count INTEGER,
         input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
-        cache_write_tokens INTEGER, reasoning_tokens INTEGER, actual_cost_usd REAL,
-        estimated_cost_usd REAL, last_seen REAL)""")
-    for provider, model, calls, cost, seen in rows:
-        conn.execute("INSERT INTO session_model_usage VALUES (?, ?, '', ?, 1, 2, 0, 0, 0, ?, ?, ?)", (provider, model, calls, cost, cost, seen))
+        cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL,
+        actual_cost_usd REAL, cost_status TEXT)""")
+    conn.execute("INSERT INTO session_model_usage VALUES ('session-1', ?, 'model', '', ?, 1, 2, 0, 0, 0, ?, ?, ?)", (provider, calls, estimated, actual, status))
     conn.commit()
     conn.close()
 
 
-def test_usage_uses_explicit_provider_classification_not_billing_mode(plugin, monkeypatch):
-    api, home = plugin
-    start = datetime(2026, 7, 1, tzinfo=api.service.TORONTO).timestamp()
-    _usage_db(home, [("openrouter", "x/model", 25, 3.5, start + 60), ("openai-codex", "gpt", 12, 0, start + 60)])
-    monkeypatch.setattr(api.service, "profile_homes", lambda: [("active", home)])
-    monkeypatch.setattr(api.service, "read_kanban", lambda: ({"delivered": 1, "approved": 1, "friction": 0}, []))
-
-    report = api.service.build_live_overview("2026-07", api.service.default_state())
-    providers = {item["provider"]: item for item in report["providers"]}
-
-    assert providers["openrouter"]["rule"]["classification"] == "payg"
-    assert providers["openrouter"]["verdict"]["action"] == "exclude"
-    assert providers["openai-codex"]["rule"]["classification"] == "flat_rate"
-    assert providers["openai-codex"]["activity"] == 12
+def _replace_usage(home: Path, *, calls: int, estimated: float, actual: float, status: str) -> None:
+    conn = sqlite3.connect(home / "state.db")
+    conn.execute("UPDATE session_model_usage SET api_call_count=?, estimated_cost_usd=?, actual_cost_usd=?, cost_status=?", (calls, estimated, actual, status))
+    conn.commit()
+    conn.close()
 
 
-def test_cross_profile_reader_caps_sources_and_fails_open(plugin):
-    api, home = plugin
-    start = datetime(2026, 7, 1, tzinfo=api.service.TORONTO).timestamp()
-    other = home.parent / "other"
-    other.mkdir()
-    _usage_db(home, [("anthropic", "claude", 4, 0, start + 60)])
-    (other / "state.db").write_text("not sqlite", encoding="utf-8")
-
-    rows, warnings = api.service.read_usage("2026-07", [("active", home), ("other", other)])
-    _, capped_warnings = api.service.read_usage("2026-07", [(str(index), other) for index in range(api.service.MAX_SOURCES + 1)])
-
-    assert rows[0]["profile"] == "active"
-    assert rows[0]["api_calls"] == 4
-    assert warnings and "profile other" in warnings[0]
-    assert capped_warnings[0] == "profile scan capped at 64 sources"
+def _row(calls: int, estimated: float = 0, actual: float = 0, status: str = "estimated", provider: str = "anthropic") -> dict[str, object]:
+    return {"profile": "active", "session_id": "s", "billing_provider": provider, "model": "m", "task": "", "api_call_count": calls, "input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "estimated_cost_usd": estimated, "actual_cost_usd": actual, "cost_status": status}
 
 
-def test_read_kanban_aggregates_multiple_boards_read_only(plugin):
-    api, _ = plugin
-    from hermes_cli import kanban_db as kb
-
-    first = kb.connect()
-    first_id = kb.create_task(first, title="accepted", assignee="marek")
-    first.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first_id,))
-    first.commit()
-    first.close()
-    kb.create_board("second")
-    second = kb.connect(board="second")
-    second_id = kb.create_task(second, title="awaiting review", assignee="marek")
-    second.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (second_id,))
-    second.commit()
-    second.close()
-
-    totals, warnings = api.service.read_kanban()
-
-    assert totals["delivered"] == 2
-    assert totals["approved"] == 1
-    assert warnings == []
-
-
-def test_closed_month_snapshot_is_immutable_after_first_following_month_load(plugin, monkeypatch):
-    api, home = plugin
-    calls = []
-    monkeypatch.setattr(api.service, "build_live_overview", lambda month, state: calls.append(month) or {
-        "month": month, "generated_at": len(calls), "providers": [], "summary": {}, "warnings": [], "provenance": {}
-    })
-    august = datetime(2026, 8, 1, tzinfo=api.service.TORONTO)
-
-    first = api.service.overview("2026-07", now=august, home=home)
-    second = api.service.overview("2026-07", now=august, home=home)
-
-    assert first["snapshot"] is False
-    assert second["snapshot"] is True
-    assert second["generated_at"] == 1
-    assert calls == ["2026-07"]
-
-
-def test_verdicts_cover_two_low_months_exception_payg_and_critical(plugin):
+def test_rollup_excludes_cross_month_delta_and_marks_transition_partial(plugin):
     api, _ = plugin
     state = api.service.default_state()
-    state["snapshots"]["2026-07"] = {"providers": [{"provider": "anthropic", "low_value": True}]}
-    low = {"provider": "anthropic", "rule": api.service.provider_rule("anthropic", state), "activity": 0, "delivered": 0, "approved": 0, "friction": 0}
-    assert api.service.verdict(low, state, "2026-08")["action"] == "cancel"
-    payg = {**low, "provider": "openrouter", "rule": api.service.provider_rule("openrouter", state)}
-    assert api.service.verdict(payg, state, "2026-08")["action"] == "exclude"
-    critical = {**low, "provider": "nous", "rule": api.service.provider_rule("nous", state)}
-    assert api.service.verdict(critical, state, "2026-08")["action"] == "keep"
-    state["exceptions"]["anthropic"] = {"reason": "client migration", "expires_on": "2099-01-01"}
-    assert api.service.verdict(low, state, "2026-08")["reason"] == "active exception"
+    june = datetime(2026, 6, 30, 23, tzinfo=api.service.TORONTO).timestamp()
+    july = datetime(2026, 7, 2, tzinfo=api.service.TORONTO).timestamp()
+    api.service.observe_usage([_row(10)], state, june)
+    api.service.observe_usage([_row(15)], state, july)
+
+    assert state["monthly_usage"].get("2026-07", {}) == {}
+    assert state["unattributed"]["2026-07"][0]["reason"] == "coverage_gap"
+    state["providers"]["anthropic"] = {}
+    report = api.service.build_live_overview("2026-07", state, observed_at=july)
+    provider = next(item for item in report["providers"] if item["provider"] == "anthropic")
+    assert report["coverage"]["status"] == "partial"
+    assert provider["verdict"]["action"] != "cancel"
 
 
-def test_private_store_api_rejects_path_traversal_and_records_manual_quota(plugin):
+def test_rollup_uses_estimated_until_actual_cost_is_confirmed(plugin):
+    api, _ = plugin
+    state = api.service.default_state()
+    observed = datetime(2026, 8, 2, tzinfo=api.service.TORONTO).timestamp()
+    api.service.observe_usage([_row(10)], state, observed)
+    api.service.observe_usage([_row(15, estimated=2, actual=0, status="estimated")], state, observed + 60)
+    api.service.observe_usage([_row(20, estimated=3, actual=1, status="confirmed")], state, observed + 120)
+    record = next(iter(state["monthly_usage"]["2026-08"].values()))
+
+    assert record["usage_cost_usd"] == 3
+    assert record["cost_status"] == "actual"
+
+
+def test_global_kanban_is_not_duplicated_across_providers(plugin, monkeypatch):
+    api, _ = plugin
+    state = api.service.default_state()
+    observed = datetime(2026, 8, 2, tzinfo=api.service.TORONTO).timestamp()
+    api.service.observe_usage([_row(1, provider="anthropic"), _row(1, provider="openai-codex")], state, observed)
+    monkeypatch.setattr(api.service, "read_usage", lambda: ([], []))
+    monkeypatch.setattr(api.service, "read_kanban", lambda: ({"delivered": 4, "approved": 3, "friction": 2}, []))
+
+    report = api.service.build_live_overview("2026-08", state, observed_at=observed)
+
+    assert report["summary"]["delivered"] == 4
+    assert all(item["delivered"] == item["approved"] == item["friction"] == 0 for item in report["providers"])
+    assert report["provenance"]["kanban"] == "global only; task/provider attribution unavailable"
+
+
+def test_openrouter_and_nous_rules_cannot_be_overridden_or_cancelled(plugin):
     api, home = plugin
+    for provider in ("openrouter", "nous"):
+        with pytest.raises(ValueError, match="immutable"):
+            api.service.update_state({"kind": "provider", "provider": provider, "classification": "flat_rate", "cancellable": True}, home)
+    state = api.service.default_state()
+    state["providers"]["nous"] = {"classification": "flat_rate", "cancellable": True}
+    state["snapshots"]["2026-08"] = {"providers": [{"provider": "nous", "low_value": True}]}
+    item = {"provider": "nous", "rule": api.service.provider_rule("nous", state), "activity": 0, "delivered": 0, "approved": 0, "friction": 0, "coverage": "complete"}
+
+    assert item["rule"]["classification"] == "critical"
+    assert item["rule"]["cancellable"] is False
+    assert api.service.verdict(item, state, "2026-09")["action"] == "keep"
+
+
+def test_private_store_rejects_symlinks_and_sets_private_permissions(plugin, tmp_path):
+    api, home = plugin
+    api.service.update_state({"kind": "manual_quota", "provider": "anthropic", "used_percent": 20}, home)
+    state_path = api.service.store_path(home)
+    lock_path = state_path.with_name(".state.lock")
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+
+    state_path.unlink()
+    state_path.symlink_to(tmp_path / "outside.json")
+    with pytest.raises(ValueError, match="symlink"):
+        api.service.load_state(home)
+    state_path.unlink()
+    lock_path.unlink()
+    lock_path.symlink_to(tmp_path / "outside.lock")
+    with pytest.raises(ValueError, match="symlink"):
+        api.service.update_state({"kind": "manual_quota", "provider": "anthropic", "used_percent": 30}, home)
+
+    other_home = tmp_path / "other-home"
+    other_home.mkdir()
+    (other_home / "plugins").symlink_to(tmp_path / "outside-directory", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        api.service.load_state(other_home)
+
+
+def test_store_transaction_prevents_lost_updates_and_preserves_snapshot(plugin, monkeypatch):
+    api, home = plugin
+    def write(provider: str) -> None:
+        api.service.update_state({"kind": "manual_quota", "provider": provider, "used_percent": 20}, home)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(write, ("anthropic", "openai-codex")))
+    state = api.service.load_state(home)
+    assert set(state["manual_quotas"]) == {"anthropic", "openai-codex"}
+
+    monkeypatch.setattr(api.service, "build_live_overview", lambda month, state, **kwargs: {"month": month, "providers": [], "summary": {}, "warnings": [], "provenance": {}})
+    august = datetime(2026, 8, 1, tzinfo=api.service.TORONTO)
+    first = api.service.overview("2026-07", now=august, home=home)
+    api.service.update_state({"kind": "manual_quota", "provider": "anthropic", "used_percent": 40}, home)
+    second = api.service.overview("2026-07", now=august, home=home)
+    assert first["snapshot"] is False
+    assert second["snapshot"] is True
+
+
+def test_configured_external_only_provider_appears_with_zero_usage_and_plan(plugin, monkeypatch):
+    api, home = plugin
+    plan = {"amount": 20, "currency": "USD", "monthly_cost_cad": 28, "cost_status": "estimated", "renewal_on": None, "status": "active", "note": "external"}
+    api.service.update_state({"kind": "provider", "provider": "anthropic", "plan": plan}, home)
+    monkeypatch.setattr(api.service, "read_usage", lambda: ([], []))
+    monkeypatch.setattr(api.service, "read_kanban", lambda: ({"delivered": 0, "approved": 0, "friction": 0}, []))
+
+    report = api.service.build_live_overview("2026-08", api.service.load_state(home))
+    provider = next(item for item in report["providers"] if item["provider"] == "anthropic")
+    assert provider["activity"] == 0
+    assert provider["rule"]["plan"] == plan
+
+
+@pytest.mark.parametrize("payload", [
+    {"kind": "exception", "provider": "anthropic", "reason": "x" * 501, "expires_on": "2026-08-01"},
+    {"kind": "exception", "provider": "anthropic", "reason": "x", "expires_on": "2026-02-30"},
+    {"kind": "manual_quota", "provider": "anthropic", "used_percent": 10, "extra": "forbidden"},
+])
+def test_settings_validation_rejects_overlong_invalid_date_and_extra_fields(plugin, payload):
+    api, _ = plugin
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/provider-roi")
-    client = TestClient(app)
+    response = TestClient(app).post("/api/plugins/provider-roi/settings", json=payload)
+    assert response.status_code == 422
 
-    bad = client.post("/api/plugins/provider-roi/settings", json={"kind": "manual_quota", "provider": "../../state", "used_percent": 20})
-    good = client.post("/api/plugins/provider-roi/settings", json={"kind": "manual_quota", "provider": "kimi-coding", "used_percent": 20})
 
-    assert bad.status_code == 400
-    assert good.status_code == 200
-    state = api.service.load_state(home)
-    assert state["manual_quotas"]["kimi-coding"]["used_percent"] == 20
-    assert api.service.store_path(home) == home / "plugins" / "provider-roi" / "state.json"
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_settings_model_rejects_nonfinite_costs(plugin, value):
+    api, _ = plugin
+    with pytest.raises(ValueError):
+        api.StoreUpdate.model_validate({"kind": "manual_quota", "provider": "anthropic", "used_percent": value})
+
+
+def test_sqlite_readonly_uri_encodes_reserved_path_characters(plugin, tmp_path):
+    api, _ = plugin
+    path = tmp_path / "state ?# database.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE proof (value TEXT)")
+    conn.execute("INSERT INTO proof VALUES ('ok')")
+    conn.commit()
+    conn.close()
+    readonly = api.service._readonly(path)
+    try:
+        assert readonly.execute("SELECT value FROM proof").fetchone()["value"] == "ok"
+        with pytest.raises(sqlite3.OperationalError):
+            readonly.execute("INSERT INTO proof VALUES ('blocked')")
+    finally:
+        readonly.close()
