@@ -21,7 +21,9 @@ from hermes_constants import get_hermes_home
 def test_worker_guidance_follows_task_ownership(role, monkeypatch):
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text("toolsets: [kanban]\nplugins:\n  enabled: []\n")
+    (home / "config.yaml").write_text(
+        "toolsets: [kanban]\nplugins:\n  enabled: []\n", encoding="utf-8"
+    )
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     if role != "orchestrator":
@@ -49,7 +51,9 @@ def test_worker_guidance_follows_task_ownership(role, monkeypatch):
 def test_guidance_snapshot_survives_ambient_task_changes(worker_at_start, monkeypatch):
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text("toolsets: [kanban]\nplugins:\n  enabled: []\n")
+    (home / "config.yaml").write_text(
+        "toolsets: [kanban]\nplugins:\n  enabled: []\n", encoding="utf-8"
+    )
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     if worker_at_start:

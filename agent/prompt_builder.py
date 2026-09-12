@@ -313,12 +313,16 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
+
 def build_kanban_guidance(tool_names: Collection[str]) -> str:
     """Board access alone does not make a session the dispatcher's task worker."""
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
-    if ("kanban_show" in tool_names and os.environ.get("HERMES_KANBAN_TASK")
-            and is_dispatcher_owned_worker_context()):
+    if (
+        "kanban_show" in tool_names
+        and os.environ.get("HERMES_KANBAN_TASK")
+        and is_dispatcher_owned_worker_context()
+    ):
         return KANBAN_GUIDANCE
     return ""
 
@@ -536,7 +540,6 @@ def steer_user_row(steer_text: str) -> Dict[str, Any]:
     never merges the next real prompt into it and history renderers can label it."""
     return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
             "display_kind": STEER_DISPLAY_KIND}
-
 
 
 STEER_CHANNEL_NOTE = (
