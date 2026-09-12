@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -1065,11 +1064,9 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Capture task ownership once so another session's ambient context cannot change this prompt.
+    from agent.prompt_builder import build_kanban_guidance
+    agent._kanban_worker_guidance = build_kanban_guidance(agent.valid_tool_names)
     if agent.quiet_mode:
         return
     if agent.tools:

@@ -13,7 +13,7 @@ import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Collection, Dict, Optional
 
 from hermes_constants import (
     get_hermes_home, get_skills_dir, is_wsl, reset_hermes_home_override, set_hermes_home_override,
@@ -313,6 +313,16 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
+def build_kanban_guidance(tool_names: Collection[str]) -> str:
+    """Board access alone does not make a session the dispatcher's task worker."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if ("kanban_show" in tool_names and os.environ.get("HERMES_KANBAN_TASK")
+            and is_dispatcher_owned_worker_context()):
+        return KANBAN_GUIDANCE
+    return ""
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "
@@ -526,6 +536,7 @@ def steer_user_row(steer_text: str) -> Dict[str, Any]:
     never merges the next real prompt into it and history renderers can label it."""
     return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
             "display_kind": STEER_DISPLAY_KIND}
+
 
 
 STEER_CHANNEL_NOTE = (
