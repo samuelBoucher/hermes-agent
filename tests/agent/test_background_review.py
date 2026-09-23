@@ -849,3 +849,73 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_review_runs_when_worker_cwd_was_removed(monkeypatch, tmp_path):
+    """A completed Kanban scratch workspace may vanish before its review starts."""
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import agent.background_review as review
+    import agent.runtime_cwd as runtime_cwd
+    from run_agent import AIAgent
+
+    parent = AIAgent(
+        model="test/model", api_key="test-key", base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True, skip_context_files=True, skip_memory=True,
+    )
+    missing = tmp_path / "removed-workspace"
+    missing.mkdir()
+    missing.rmdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(missing))
+    calls = []
+    real_run = AIAgent.run_conversation
+
+    def run_review(self, *args, **kwargs):
+        calls.append(runtime_cwd.resolve_agent_cwd())
+        self.client = MagicMock()
+        self.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(index=0, message=SimpleNamespace(
+                role="assistant", content="review complete", tool_calls=None,
+                reasoning_content=None), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+            model="test/model",
+        )
+        self._disable_streaming = True
+        self._use_prompt_caching = False
+        result = real_run(self, *args, **kwargs)
+        calls.append(self.client.chat.completions.create.call_count)
+        return result
+
+    # A deleted process cwd makes os.getcwd() fail, even after a stale
+    # TERMINAL_CWD is rejected. This is the worker teardown's failure shape.
+    with patch.object(os, "getcwd", side_effect=FileNotFoundError(2, "No such file or directory")), \
+         patch.object(AIAgent, "run_conversation", run_review):
+        review._run_review_in_thread(parent, [], "review this turn")
+
+    assert len(calls) == 2
+    assert calls[0].is_dir()
+    assert calls[1] == 1
+    assert runtime_cwd.scope_terminal_cwd() == str(missing)
+
+
+def test_review_preserves_valid_session_cwd_with_removed_terminal_cwd(monkeypatch, tmp_path):
+    from agent.background_review import _review_working_directory
+    from agent.runtime_cwd import (
+        reset_session_cwd, resolve_agent_cwd, scope_terminal_cwd, set_session_cwd,
+    )
+
+    missing = tmp_path / "removed-workspace"
+    session_dir = tmp_path / "session-workspace"
+    session_dir.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(missing))
+    token = set_session_cwd(str(session_dir))
+    try:
+        with _review_working_directory():
+            assert resolve_agent_cwd() == session_dir
+            assert scope_terminal_cwd() == str(session_dir)
+        assert resolve_agent_cwd() == session_dir
+        assert scope_terminal_cwd() == str(missing)
+    finally:
+        reset_session_cwd(token)

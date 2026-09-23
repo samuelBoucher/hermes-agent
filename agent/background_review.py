@@ -14,6 +14,7 @@ import os
 import threading
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
@@ -1129,6 +1130,33 @@ def _release_fork_clients(review_agent: Any) -> None:
     with suppress(Exception):
         review_agent.release_clients()
 
+@contextmanager
+def _review_working_directory() -> Iterator[None]:
+    """Keep a detached review off a worker workspace removed after completion."""
+    from agent.runtime_cwd import resolve_context_cwd, reset_session_cwd, scope_terminal_cwd, set_session_cwd
+    from tools.terminal_scope import get_terminal_scope, reset_terminal_scope, set_terminal_scope
+
+    configured = scope_terminal_cwd().strip()  # A refusal scope must still fail closed.
+    if not configured or Path(configured).expanduser().is_dir():
+        yield
+        return
+    fallback = resolve_context_cwd() or Path.home()
+    if not fallback.is_dir():
+        raise FileNotFoundError(f"Background review fallback cwd does not exist: {fallback}")
+    scope = get_terminal_scope()
+    policy = dict(scope) if scope is not None else {
+        k: v for k, v in os.environ.items() if k.startswith("TERMINAL_")
+    }
+    policy["TERMINAL_CWD"] = str(fallback)
+    terminal_token = set_terminal_scope(policy)
+    cwd_token = set_session_cwd(str(fallback))
+    logger.warning("Background review workspace disappeared: %s; using %s", configured, fallback)
+    try:
+        yield
+    finally:
+        reset_session_cwd(cwd_token)
+        reset_terminal_scope(terminal_token)
+
 
 def _run_review_fork(
     agent: Any, messages_snapshot: List[Dict], prompt: str, task_cfg: Optional[Dict[str, Any]],
@@ -1239,7 +1267,7 @@ def _run_review_in_thread(
         # driving a Telegram long-poll — for the full duration of the review (tens of seconds), swallowing
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
-        with thread_scoped_silence():
+        with _review_working_directory(), thread_scoped_silence():
             _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
