@@ -1133,14 +1133,14 @@ def _release_fork_clients(review_agent: Any) -> None:
 @contextmanager
 def _review_working_directory() -> Iterator[None]:
     """Keep a detached review off a worker workspace removed after completion."""
-    from agent.runtime_cwd import reset_session_cwd, scope_terminal_cwd, set_session_cwd
+    from agent.runtime_cwd import resolve_context_cwd, reset_session_cwd, scope_terminal_cwd, set_session_cwd
     from tools.terminal_scope import get_terminal_scope, reset_terminal_scope, set_terminal_scope
 
     configured = scope_terminal_cwd().strip()  # A refusal scope must still fail closed.
     if not configured or Path(configured).expanduser().is_dir():
         yield
         return
-    fallback = Path.home()
+    fallback = resolve_context_cwd() or Path.home()
     if not fallback.is_dir():
         raise FileNotFoundError(f"Background review fallback cwd does not exist: {fallback}")
     scope = get_terminal_scope()

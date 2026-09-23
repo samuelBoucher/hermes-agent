@@ -898,3 +898,24 @@ def test_review_runs_when_worker_cwd_was_removed(monkeypatch, tmp_path):
     assert calls[0].is_dir()
     assert calls[1] == 1
     assert runtime_cwd.scope_terminal_cwd() == str(missing)
+
+
+def test_review_preserves_valid_session_cwd_with_removed_terminal_cwd(monkeypatch, tmp_path):
+    from agent.background_review import _review_working_directory
+    from agent.runtime_cwd import (
+        reset_session_cwd, resolve_agent_cwd, scope_terminal_cwd, set_session_cwd,
+    )
+
+    missing = tmp_path / "removed-workspace"
+    session_dir = tmp_path / "session-workspace"
+    session_dir.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(missing))
+    token = set_session_cwd(str(session_dir))
+    try:
+        with _review_working_directory():
+            assert resolve_agent_cwd() == session_dir
+            assert scope_terminal_cwd() == str(session_dir)
+        assert resolve_agent_cwd() == session_dir
+        assert scope_terminal_cwd() == str(missing)
+    finally:
+        reset_session_cwd(token)
