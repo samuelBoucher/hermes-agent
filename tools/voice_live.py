@@ -42,13 +42,14 @@ GPT_LIVE_VOICES = (
     "bossa", "tempo", "beacon", "delta", "cinder",
 )
 
-# Persona for the voice layer. Short on purpose: the live model has a small context window and
-# the vendor guide asks for role + style + a labelled delegation policy, nothing more. The
-# backend (Hermes) carries the real instructions, tools and memory.
-LIVE_PERSONA = (
+# The configured voice.gpt_live.instructions replaces only this default style. The protocol
+# remains in every session: Live speaks, while Hermes handles facts and work with its tools.
+DEFAULT_LIVE_STYLE = (
     "You are Hermes, a calm and friendly voice assistant. Speak naturally at an unhurried pace. "
     "Be clear and direct, not overly cheerful. If the user is frustrated, acknowledge it briefly "
-    "and focus on the next helpful step.\n\n"
+    "and focus on the next helpful step."
+)
+LIVE_PROTOCOL = (
     "Backchannel policy: Use moderate backchannels. Acknowledge naturally without competing with "
     "the main response.\n\n"
     "Interruption policy: Stop speaking when the user interrupts. Listen to what they say.\n\n"
@@ -125,7 +126,7 @@ def _resolve_credentials(live: Dict[str, Any]) -> tuple[str, str]:
 
 def live_instructions(live: Optional[Dict[str, Any]] = None) -> str:
     extra = str((live if live is not None else _live_section()).get("instructions") or "").strip()
-    return f"{LIVE_PERSONA}\n\n{extra}" if extra else LIVE_PERSONA
+    return f"{extra or DEFAULT_LIVE_STYLE}\n\n{LIVE_PROTOCOL}"
 
 
 def resolve_gpt_live_status() -> Dict[str, Any]:

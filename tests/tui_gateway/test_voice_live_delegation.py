@@ -74,7 +74,8 @@ class TestSessionCreation:
         session = captured["body"]["session"]
         assert session["delegation"] == {"type": "client"}
         assert session["audio"]["output"]["voice"] == "willow"
-        assert session["instructions"].endswith("Speak Spanish.")
+        assert session["instructions"].startswith("Speak Spanish.\n\nBackchannel policy:")
+        assert "Delegate to the backend when:" in session["instructions"]
         assert session["input"][0]["role"] == "user"
         assert captured["body"]["transport"] == {"type": "webrtc", "sdp": "v=0 offer"}
         assert "sk-test" not in json.dumps(result)
